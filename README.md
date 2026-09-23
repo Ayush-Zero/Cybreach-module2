@@ -6,17 +6,17 @@ Cybreach main integration repo — aggregates all pod work as git submodules.
 
 | Pod | Responsibility | Repository directory |
 | --- | --- | --- |
-| Alpha | Rule Ingestion + Connector Framework | `VALIDATOR/` |
-| Beta | Validation Engine + Outcome Classifier | `cybreach-module2-pod-beta/` |
+| Alpha | Rule Ingestion + Connector Framework | `cybreach_pod_alpha/` |
+| Beta | Validation Engine + Outcome Classifier | `cybreach_pod_beta/` |
 | Gamma | OCSF Normalizer + Re-Validation Service | `cybreach_pod_gamma/` |
-| Delta | Verdict Publisher + Frontend Dashboard + API Gateway | `verdict-platform/` |
+| Delta | Verdict Publisher + Frontend Dashboard + API Gateway | `cybreach_pod_delta/` |
 
 ## Adding your pod as a submodule
 
-If you are a pod in-charge, add your repository here as a submodule under its mapped directory above:
+If you are a pod in-charge, add your repository here as a submodule using the `cybreach_pod_<pod>` naming convention:
 
 ```powershell
-git submodule add <your-git-repo-url> <directory-name>
+git submodule add <your-git-repo-url> cybreach_pod_<pod>
 ```
 
 Example (Gamma):
