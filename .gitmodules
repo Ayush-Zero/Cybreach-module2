@@ -4,3 +4,6 @@
 [submodule "cybreach_pod_delta"]
 	path = cybreach_pod_delta
 	url = https://github.com/CyBreach-Validator/verdict-platform.git
+[submodule "cybreach_pod_beta"]
+	path = cybreach_pod_beta
+	url = https://github.com/gadugulalakshmi/cybreach-module2-pod-beta
