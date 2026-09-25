@@ -7,7 +7,7 @@
   See `CyBreach_Module2_TheValidator.txt` - "Local Development Setup" (~line 862): venv ->
   `pip install -r requirements.txt` -> infra `docker compose` -> alembic migrations -> pytest ->
   `uvicorn` per service (e.g. Validation Engine on port 8002) -> verify `/health`.
-- **Conflict source:** `conflict.md` (2026-09-24 post-audit statuses) + new per-pod findings (`N-A#`/`N-B#`/`N-G#`/`N-D#`).
+- **Conflict source:** `conflict.md` (2026-09-24 post-audit statuses, updated after the Gamma pod advanced to `452ed18`) + new per-pod findings (`N-A#`/`N-B#`/`N-G#`/`N-D#`; Gamma `N-G1..N-G8` all PATCHED).
 
 ## Goal
 
@@ -33,7 +33,7 @@ topics (`cybreach.evidence.v1`, `cybreach.verdicts.v2`, `cybreach.gap_closed.v2`
 | --- | --- | --- | --- |
 | P1 | **N-B1** Beta syntax error (`services/validation_engine/ve_app/main.py:150-155`) | Beta | Delete the orphaned `def validate_evidence(` stub (lines 150-153); keep the real implementation at line 155 |
 | P2 | **M7** Delta backend won't boot fresh: no `.env`, missing runtime deps (`kafka`, `slowapi`, `jose`, `alembic`) | Delta | Add `.env.example` + clear DB-URL error; declare all runtime deps in `requirements.txt` |
-| P3 | **M1 + N-B3 + N-G5** port collisions (`8000` claimed 5x, `8003` x2 Gamma/Beta oc, `5173` x2 frontends) | Integration env (all) | One port registry for local uvicorn runs + frontends per plan local-dev example |
+| P3 | **M1 + N-B3** port collisions - ~~N-G5 Gamma side done~~ (`8000` still claimed 5x, `8002` Beta `ve_app` vs Delta Kong, `5173` Delta frontend) | Integration env (all) | One port registry for local uvicorn runs + frontends per plan local-dev example (Gamma already on 8005/8006/5174 per `port-registery.md`) |
 | P4 | **B10** two Kafka topologies both binding `9092` (Beta KRaft vs Delta ZooKeeper) | Integration env (infra only) | Single infra `docker-compose.yml` (postgres/redis/KRaft Kafka per Beta, retire Delta ZooKeeper) |
 
 ## Tier 1 - One bus + one set of cross-pod contracts (data must flow)
@@ -53,7 +53,7 @@ Each execution task belongs to the pod(s) listed here (matches the `Owner` colum
 
 - **Alpha (Rule Ingestion + Connector Framework):** P8 (rule-delivery seam - expose `GET /api/v2/rules` for Beta to consume).
 - **Beta (Validation Engine + Outcome Classifier):** P1 (N-B1 syntax fix), P8 (consume Alpha's rules, not a local stub), P10 (confidence scale / `rule_id` type).
-- **Gamma (OCSF Normalizer + Re-Validation):** P3 (port registry - normalizer/revalidation move to 8005/8006); otherwise no boot-task ownership for the first hybrid run (deferred to Tier 3).
+- **Gamma (OCSF Normalizer + Re-Validation):** P3 (port registry - normalizer/revalidation are already on 8005/8006, frontend 5174 -> 8005, per `port-registery.md`); otherwise no boot-task ownership for the first hybrid run.
 - **Delta (Verdict Publisher + Dashboard + Gateway):** P2 (env/deps boot), P3 (port registry), P5 (canonical topic names), P6 (evidence consumers), P7 (v2.0 verdict serialization), P9 (`/api/v2/*` routes + Kong upstream/port), P10 (confidence 0-1, `rule_id` string).
 - **Integration environment (infra):** P3 (port-registry coordination across pods), P4 (single infra compose - postgres/redis/KRaft Kafka), P5 (topic manifest shared with all pods).
 
@@ -65,18 +65,19 @@ Each execution task belongs to the pod(s) listed here (matches the `Owner` colum
 
 ## Tier 3 - Defer for the first hybrid run
 
-- **Containerization milestone (N-B2, N-D3, m4)**: Beta zero Dockerfiles, Delta empty `backend/Dockerfile`,
-  Gamma `ocsf_normalizer`/`revalidation_service` `.txt` stubs. NOT required for hybrid run (services run via
+- **Containerization milestone (N-B2, N-D3)**: Beta zero Dockerfiles, Delta empty `backend/Dockerfile`.
+  ~~Gamma `ocsf_normalizer`/`revalidation_service` `.txt` stubs (replaced by real Dockerfiles on 8005/8006 - m4 done)~~.
+  NOT required for hybrid run (services run via
   uvicorn); optional milestone for a later full-Docker deployment.
 - **B11** shared JWT / tenant scoping.
-- **m7** secrets hygiene (hardcoded `admin/admin123`, `SECRET_KEY`, `validator_dev_pw`, committed `connectors.db`).
+- **m7** secrets hygiene (hardcoded `admin/admin123`, `SECRET_KEY`, `validator_dev_pw`). ~~committed `connectors.db` (Gamma untracked/removed)~~.
 - **m8** SSRF allow-list on `clone_repo` + 422 on malformed `rule_query`.
-- **M6** dependency pin reconciliation.
-- **M5** `shared_registry/v1/` wiring.
-- **M8** wallet credit/debit hooks (file exists but never invoked).
+- **M6** dependency pin reconciliation (Gamma manifests now internally consistent; Beta / Delta / Alpha divergence remains).
+- **M5** `shared_registry/v1/` wiring (Gamma README + `publish_contract.py` now point at `contracts/`; consumer wiring still open).
+- ~~**M8** wallet credit/debit hooks (file exists but never invoked).~~ **PATCHED (2026-09-24):** `/api/v2/revalidate` debits 1 credit (402 when broke), refunds on `UNCHANGED`, `GET /api/v2/revalidate/wallet`.
 - **B7/B12/M3/M10** ownership dedupe (Beta duplicate `verdict_publisher` + `ve_app/connectors.py`; Alpha `Rule_Dependency_Tracker/app`; Delta `/rules`/`/connectors`).
 - **m2/m3** migration dedupe + Beta week snapshots.
-- **N-G1** Gamma `schema_engine/` duplicate subtree.
+- ~~**N-G1** Gamma `schema_engine/` duplicate subtree.~~ **PATCHED (2026-09-24):** removed; `ocsf_normalizer/` + `revalidation_service/` canonical.
 - **N-D2/N-D6/N-D7** Delta alembic chain inconsistency, consumer import loop, committed DB creds (correctness/security; not boot-blocking).
 
 ## Suggested port registry (hybrid local run)
@@ -95,6 +96,8 @@ Each execution task belongs to the pod(s) listed here (matches the `Owner` colum
 | Frontend dashboard (Delta) | Delta | 5173 |
 | Frontend (Gamma, optional) | Gamma | 5174 |
 | Kong (optional gateway) | Delta | 8010 proxy / 8011 admin |
+
+> Gamma services are already bound to their assigned ports as of 2026-09-24 (normalizer 8005, revalidation 8006, frontend 5174 -> 8005).
 
 ## Verification of "run" (hybrid)
 
