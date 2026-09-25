@@ -1,6 +1,6 @@
 # CyBreach Module 2 - Cross-Pod Integration Conflicts
 
-- **Date:** 2026-09-22 (Original review) | **Updated:** 2026-09-24 (Post-audit status appended)
+- **Date:** 2026-09-22 (Original review) | **Updated:** 2026-09-24 (Post-audit status appended; Gamma pod advanced to `452ed18` and its fixes annotated)
 - **Scope:** Pod integration readiness review for Module 2 (The Validator)
 - **Plan source:** `CyBreach_Module2_TheValidator_TextOnly.pdf` (authoritative spec: services, contracts, API surface, topics, security, credits)
 - **Method:** Static compatibility review across all four pod repositories; each finding cites the files involved and the plan section it violates. On 2026-09-24 every pod was re-audited against its current HEAD and every conflict annotated with a live status (`PATCHED` / `PARTIAL` / `STILL PRESENT`).
@@ -143,12 +143,12 @@
 
 - **Violates:** plan Section 7 local dev / Section 8 (one coherent environment).
 - **Where:**
-  - `8000` claimed by: Delta backend (docs, `cybreach_pod_delta/frontend-dashboard/src/services/api.ts:4`, `websocketService.ts:10`), Kong (`cybreach_pod_delta/docker-compose.yml:46`), Gamma normalizer + revalidation (uvicorn default), Beta `vp_app` (default), Alpha docs (`VALIDATOR/rule ingestion/app/README.md:26`).
+  - `8000` claimed by: Delta backend (docs, `cybreach_pod_delta/frontend-dashboard/src/services/api.ts:4`, `websocketService.ts:10`), Kong (`cybreach_pod_delta/docker-compose.yml:46`), Beta `vp_app` (default), Alpha docs (`VALIDATOR/rule ingestion/app/README.md:26`). ~~Gamma normalizer + revalidation (uvicorn default) - now on 8005/8006~~.
   - `8002` claimed by: Beta Validation Engine (`cybreach-module2-pod-beta/services/validation_engine/ve_app/main.py:9`, per plan local-dev example) vs Delta Kong (`cybreach_pod_delta/api-gateway/docker-compose.yml:14`).
-  - `5173` claimed by: Gamma frontend (`cybreach_pod_gamma/frontend/vite.config.js`) and Delta frontend (`cybreach_pod_delta/frontend-dashboard/vite.config.ts`).
+  - `5173` claimed by: Delta frontend (`cybreach_pod_delta/frontend-dashboard/vite.config.ts`). ~~Gamma frontend (`cybreach_pod_gamma/frontend/vite.config.js`) - now on 5174~~.
 - **Impact:** Up to 5+ services cannot run together; frontends cannot serve simultaneously.
 - **Resolution:** Port registry per service (see reconciliation table); gateway internal porting.
-- **Status (2026-09-24):** PARTIAL. Gamma moved its revalidation image to `8003` (`Dockerfile:10-12`, `schema_engine/Dockerfile`) but normalizer + revalidation still default to `8000` when run via uvicorn/README, and the frontend proxy still points at `8000` (`frontend/vite.config.js:10`). All other collisions unchanged. NEW: Beta Outcome Classifier also claims `8003` (`oc_app/main.py:5`) - now collides with Gamma's new 8003.
+- **Status (2026-09-24, updated after gamma refetch):** PARTIAL. ~~Gamma moved its revalidation image to `8003` (`Dockerfile:10-12`, `schema_engine/Dockerfile`) but normalizer + revalidation still default to `8000` when run via uvicorn/README, and the frontend proxy still points at `8000` (`frontend/vite.config.js:10`). All other collisions unchanged. NEW: Beta Outcome Classifier also claims `8003` (`oc_app/main.py:5`) - now collides with Gamma's new 8003.~~ **Gamma side resolved:** normalizer binds `8005`, revalidation `8006` (uvicorn main guards + Dockerfiles), frontend on `5174` proxying `/api` -> `8005`; README aligned (see N-G5). REMAINS (other pods): `8000` (Delta backend/Kong, Beta `vp_app`, Alpha docs), `8002` (Beta `ve_app` vs Delta Kong), `5173` (Delta frontend). Beta `oc_app` `8003` no longer collides with Gamma.
 
 ### M2. Verdict enum spelling: `NoData` vs `No Data`
 
@@ -164,7 +164,7 @@
 - **Where:** Alpha `VALIDATOR/rule ingestion/app/api/connector_routes.py` (`/api/v2/connectors/*`); Delta `cybreach_pod_delta/backend/app/api/connectors*` (`/connectors`, `/connectors/{id}`); Gamma webhook connectors `cybreach_pod_gamma/ocsf_normalizer` (`/api/v2/webhook/connectors`). Alpha docs claim Gamma/Delta consume its health surface - neither does.
 - **Impact:** Three registries, three health shapes; connector health cannot be aggregated.
 - **Resolution:** Single registry per Alpha (owner of Connector Framework); others consume.
-- **Status (2026-09-24):** PARTIAL. Gamma consolidated webhook connector routes to one file (`ocsf_normalizer/src/main.py:384,411`), but the custom OCSF class-registry API still exists 3x (`app/routes/custom_ocsf.py`, `schema_engine/app/routes/custom_ocsf.py`, `ocsf_normalizer/src/main.py:124-224`), and the whole Gamma stack is duplicated under `schema_engine/`. Alpha + Delta registries unchanged.
+- **Status (2026-09-24):** PARTIAL. Gamma consolidated webhook connector routes to one file (`ocsf_normalizer/src/main.py:384,411`). ~~the custom OCSF class-registry API still exists 3x (`app/routes/custom_ocsf.py`, `schema_engine/app/routes/custom_ocsf.py`, `ocsf_normalizer/src/main.py:124-224`), and the whole Gamma stack is duplicated under `schema_engine/`~~ (**Gamma side fixed:** duplicate routes + the `schema_engine/` subtree deleted - see N-G1; single registry in `ocsf_normalizer/src/main.py:124-224`). Alpha + Delta registries unchanged.
 
 ### M4. Rule-dependency integration is one-sided
 
@@ -180,7 +180,7 @@
 - **Where:** Gamma `cybreach_pod_gamma/publish_contract.py:7` writes to `shared_registry/v1/` - directory exists **nowhere** in the workspace; nothing reads from it.
 - **Impact:** Cross-pod contract publishing mechanism is unwired; published file is an OCSF field-mapping sample, not a schema contract.
 - **Resolution:** Stand up one shared registry (root `contracts/` or the `shared_registry/v1/` dir); every pod publishes frozen schemas there and contract tests load from it.
-- **Status (2026-09-24):** PARTIAL. ~~`shared_registry/v1/windows_auth.json` now exists in Gamma (tracked)~~. But `publish_contract.py` now writes to `contracts/ocsf_normalizer_schema.v1.json` instead, README still claims the old path, and nothing in any pod consumes `shared_registry/v1/` today.
+- **Status (2026-09-24):** PARTIAL. ~~`shared_registry/v1/windows_auth.json` now exists in Gamma (tracked)~~; `publish_contract.py` now writes to `contracts/ocsf_normalizer_schema.v1.json`. ~~README still claims the old path~~ (**Gamma side fixed:** README + `publish_contract.py` now document `contracts/` as the cross-pod publish target - see N-G3). Still unwired: nothing in any pod consumes `shared_registry/v1/` today.
 
 ### M6. Mutual-exclusion dependency pins
 
@@ -188,7 +188,7 @@
 - **Where:** `fastapi==0.115.6` (beta) vs `==0.141.1` (gamma) vs `==0.139.0` (delta) vs unpinned (alpha); `pydantic 2.10.3 / 2.13.4`; `uvicorn 0.32.1 / 0.52.2 / 0.49.0`; `pytest 8.3.4 / 9.1.1`.
 - **Impact:** No single requirement set satisfies all pods; a shared CI/dev env is impossible.
 - **Resolution:** Reconcile to one pinned set from plan Section 8 (FastAPI >=0.115.x line).
-- **Status (2026-09-24):** STILL PRESENT. Gamma still `fastapi==0.141.1, pydantic==2.13.4, uvicorn==0.52.2`; Delta still `fastapi==0.139.0` plus anomalous pins (`starlette==1.3.1`); Beta `0.115.6`; Alpha unpinned. No `contracts/requirements.lock` exists.
+- **Status (2026-09-24):** STILL PRESENT. ~~Gamma manifests were self-inconsistent (`httpx2` in root + `ocsf_normalizer`); they are now reconciled to one pinned set across root/`ocsf_normalizer`/`revalidation_service` (`fastapi==0.141.1, pydantic==2.13.4, uvicorn==0.52.2, pytest==9.1.1, httpx>=0.27.0`)~~ (Gamma internally consistent). Cross-pod divergence REMAINS: Delta still `fastapi==0.139.0` plus anomalous pins (`starlette==1.3.1`); Beta `0.115.6`; Alpha unpinned. No `contracts/requirements.lock` exists.
 
 ### M7. Delta backend cannot boot in a fresh checkout
 
@@ -204,7 +204,7 @@
 - **Where:** No reference to `credit`, `wallet`, or `debit` in any pod (`grep` across all Python files returns nothing).
 - **Impact:** Re-validation cost accounting (a contract with Module 4) is entirely absent.
 - **Resolution:** Add mock wallet client (default 100 credits) in Gamma's Re-Validation Service; debit/refund hooks per plan Section 9.
-- **Status (2026-09-24):** PARTIAL. ~~Gamma added `revalidation_service/src/wallet.py` (`WalletClient(initial_balance=100)` with `debit()`/`refund()`)~~ - but it is **never imported/used**: `revalidate()` in `revalidation_service/src/main.py:65-83` performs no debit and has no refund path. No other pod has wallet code.
+- **Status (2026-09-24):** ~~PARTIAL. Gamma added `revalidation_service/src/wallet.py` (`WalletClient(initial_balance=100)` with `debit()`/`refund()`) - but it is **never imported/used**; `revalidate()` in `revalidation_service/src/main.py:65-83` performs no debit and has no refund path. No other pod has wallet code.~~ **PATCHED (2026-09-24):** wallet is wired into `revalidate()` - debits 1 credit per run (HTTP 402 when the balance is exhausted), refunds 1 on `UNCHANGED`, and `GET /api/v2/revalidate/wallet` returns the balance (`revalidation_service/src/main.py:72-105`).
 
 ### M9. Internal gRPC plumbing absent
 
@@ -247,7 +247,7 @@
 - **Violates:** plan Section 7 local-dev "verify health via /health"; plan Section 5 connector health aggregation.
 - **Where:** `{"status":"ok"}` (beta, delta) vs `{"status":"healthy"}` (alpha, gamma revalidation) vs `{"status":"ok","service":...}` (beta services).
 - **Resolution:** Normalize to `{"status": "ok"}` + optional `service` field.
-- **Status (2026-09-24):** PARTIAL. ~~Beta patched internally: all three Beta services now return the uniform `{"status":"ok","service":...}` (`ve_app/main.py:205`, `oc_app/main.py:83`, `vp_app/main.py:64-66`)~~. Cross-pod still divergent: Alpha `{"status":"healthy"}` (`app/main.py:102`), Gamma `{"status":"healthy"}` (`src/main.py:11`) / `{"status":"online"}` (`app/main.py:19-25`).
+- **Status (2026-09-24):** PARTIAL. ~~Beta patched internally: all three Beta services now return the uniform `{"status":"ok","service":...}` (`ve_app/main.py:205`, `oc_app/main.py:83`, `vp_app/main.py:64-66`)~~. ~~Gamma patched internally: normalizer + revalidation now return `{"status":"ok","service":...}` via `/health` (`ocsf_normalizer/src/main.py:82-85`, `revalidation_service/src/main.py:67-69`); the old `{"status":"healthy"}`/`{"status":"online"}` shapes were deleted with the duplicate subtree~~. Cross-pod still divergent: Alpha `{"status":"healthy"}` (`app/main.py:102`).
 
 ### m2. Duplicate `connectors` table + no-op migrations in Delta
 
@@ -268,13 +268,13 @@
 - **Violates:** plan Week 1 CI/CD + Docker configuration.
 - **Where:** `cybreach_pod_gamma/Dockerfile.txt`, `.dockerignore.txt`, `.github/workflows/ci.yml.txt` (renamed `.txt`) - no buildable images or CI.
 - **Resolution:** Restore extensions and wire a working pipeline.
-- **Status (2026-09-24):** PARTIAL. ~~Root `Dockerfile`, `.dockerignore`, `.github/workflows/ci.yml`, and `schema_engine/` equivalents restored (tracked)~~. Still `.txt`/empty stubs in `ocsf_normalizer/` and `revalidation_service/` (`Dockerfile.txt`, `.dockerignore.txt`, `.github/workflows/ci.yml.txt` all 0 bytes).
+- **Status (2026-09-24):** ~~PARTIAL. Root `Dockerfile`, `.dockerignore`, `.github/workflows/ci.yml`, and `schema_engine/` equivalents restored (tracked); `ocsf_normalizer/` + `revalidation_service/` still `.txt`/empty stubs (`Dockerfile.txt`, `.dockerignore.txt`, `.github/workflows/ci.yml.txt` all 0 bytes)~~ **PATCHED (2026-09-24):** per-service `Dockerfile`s (normalizer EXPOSE + uvicorn 8005; revalidation 8006) and non-empty `.dockerignore`s added; all `.txt` stubs deleted; root copies + `schema_engine/` subtree removed (see N-G1).
 
 ### m5. Gamma test/requirement inconsistency
 
 - **Where:** Gamma tests use `fastapi.testclient.TestClient` (needs `httpx`), but root `requirements.txt` pins `httpx2==2.10.0` (nonstandard pkg name); `revalidation_service/requirements.txt` lists both `httpx2` and `httpx`. README's root `pytest` flow will likely fail.
 - **Resolution:** Pin the real `httpx` package consistently across gamma manifests.
-- **Status (2026-09-24):** PARTIAL. ~~`revalidation_service/requirements.txt` fixed to only `httpx>=0.27.0`~~. Root `requirements.txt:5` and `ocsf_normalizer/requirements.txt:5` still pin `httpx2 == 2.10.0`; root CI installs `httpx2` then runs `pytest` against `ocsf_normalizer/tests` which need real `httpx` - CI would fail.
+- **Status (2026-09-24):** ~~PARTIAL. `revalidation_service/requirements.txt` fixed to only `httpx>=0.27.0`; root `requirements.txt:5` + `ocsf_normalizer/requirements.txt:5` still `httpx2 == 2.10.0`, so root CI would fail~~ **PATCHED (2026-09-24):** all three manifests pin `httpx >= 0.27.0` (root, `ocsf_normalizer`, `revalidation_service`); CI also runs the `revalidation_service` suite (see N-G4).
 
 ### m6. Connector vendor enum casing inconsistency
 
@@ -287,7 +287,7 @@
 - **Violates:** plan review checklist "No hardcoded secrets".
 - **Where:** Hardcoded `admin/admin123` (`cybreach_pod_delta/backend/app/api/auth.py:14-15`, `docs/API_REFERENCE.md`); plaintext Postgres password `validator_dev_pw` (`cybreach-module2-pod-beta/docker-compose.yml:10`); `cybreach_pod_gamma/connectors.db` (SQLite) committed.
 - **Resolution:** Env/vault for all secrets; gitignore runtime artifacts.
-- **Status (2026-09-24):** ~~Alpha side clean~~ (Alpha added `app/connector/credential_manager.py` - env-driven Fernet encryption, no hardcoded secrets, `alembic.ini` leaves DB URL blank). REMAINS: Delta `admin/admin123` + hardcoded `SECRET_KEY` (`security.py:9`) + committed DB creds `postgres:vyom` (`backend/alembic.ini:89`); Beta `POSTGRES_PASSWORD: validator_dev_pw` (`docker-compose.yml:10`); Gamma `connectors.db` still committed and tracked.
+- **Status (2026-09-24):** ~~Alpha side clean~~ (Alpha added `app/connector/credential_manager.py` - env-driven Fernet encryption, no hardcoded secrets, `alembic.ini` leaves DB URL blank). ~~Gamma side fixed: `connectors.db` untracked and removed from the repo (2026-09-24)~~. REMAINS: Delta `admin/admin123` + hardcoded `SECRET_KEY` (`security.py:9`) + committed DB creds `postgres:vyom` (`backend/alembic.ini:89`); Beta `POSTGRES_PASSWORD: validator_dev_pw` (`docker-compose.yml:10`).
 
 ### m8. SSRF-adjacent ingest by design
 
@@ -305,7 +305,7 @@ Re-audit of each repository at its current HEAD. `PATCHED` = resolved; `PARTIAL`
 | --- | --- | --- | --- | --- | --- |
 | Alpha | `VALIDATOR/` | 12 STILL PRESENT (B3/B4/B9 = Delta-only) | 11 STILL PRESENT + 1 PARTIAL (B8) | 5 STILL PRESENT, 2 PATCHED | 5 (N-A1..N-A5) |
 | Beta | `cybreach-module2-pod-beta/` | 13 STILL PRESENT | 11 STILL PRESENT + 1 PARTIAL (M1) | 6 STILL PRESENT, 1 PARTIAL (m1) | 4 (N-B1..N-B4) |
-| Gamma | `cybreach_pod_gamma/` | B11 STILL PRESENT | 5 PARTIAL (M1,M3,M5,M8) | 3 STILL PRESENT, 3 PARTIAL (m1,m4,m5) | 8 (N-G1..N-G8) |
+| Gamma | `cybreach_pod_gamma/` | B11 STILL PRESENT | M8 PATCHED; M1/M3/M5 PARTIAL (Gamma side fixed, cross-pod open) | m4/m5 PATCHED; m1/m7 PARTIAL (Gamma side fixed, cross-pod open) | N-G1..N-G8 PATCHED |
 | Delta | `cybreach_pod_delta/` | 13 STILL PRESENT | 12 STILL PRESENT | 8 STILL PRESENT | 8 (N-D1..N-D8) |
 
 ### Pod Alpha - `VALIDATOR/`
@@ -345,23 +345,27 @@ Re-audit of each repository at its current HEAD. `PATCHED` = resolved; `PARTIAL`
 **Patched / resolved:**
 
 - ~~M2 (Gamma side): no `NoData`/`No Data` anywhere in source; revalidation verdict enum is `IMPROVED`/`DEGRADED`/`UNCHANGED`~~ (`revalidation_service/src/core/contracts.py:52`).
-- ~~M5: `shared_registry/v1/windows_auth.json` now exists and is tracked~~ (still unwired - see below).
-- ~~M8: `revalidation_service/src/wallet.py` added with default 100 credits + debit/refund~~ (still not invoked - see below).
-- ~~m4: root `Dockerfile`, `.dockerignore`, `.github/workflows/ci.yml` and `schema_engine/` equivalents restored~~ (sub-service dirs still `.txt` stubs).
-- ~~m5: `revalidation_service/requirements.txt` fixed to real `httpx`~~ (root + `ocsf_normalizer` still `httpx2`).
+- ~~M5 (Gamma side): `shared_registry/v1/windows_auth.json` now exists and is tracked; README + `publish_contract.py` now document `contracts/` as the publish target~~ (still unwired cross-pod - see below).
+- ~~M8: `revalidation_service/src/wallet.py` added with default 100 credits + debit/refund (still not invoked)~~ => **PATCHED:** wired into `revalidate()` - debits 1 credit, refunds on `UNCHANGED`, `GET /api/v2/revalidate/wallet` (`revalidation_service/src/main.py:72-105`).
+- ~~M1 (Gamma side): normalizer/revalidation no longer default to 8000/8003; bind 8005/8006 with frontend on 5174 -> 8005~~ (N-G5; cross-pod 8000/8002/5173 remain with other pods).
+- ~~M3 (Gamma side): duplicated class-registry routes and the whole `schema_engine/` subtree removed; single registry left in `ocsf_normalizer/src/main.py:124-224`~~ (Alpha + Delta registries unchanged).
+- ~~m4: root `Dockerfile`, `.dockerignore`, `.github/workflows/ci.yml` and `schema_engine/` equivalents restored~~ => **PATCHED:** per-service Dockerfiles (8005/8006) + non-empty `.dockerignore`; `.txt` stubs removed (N-G1 / N-G6).
+- ~~m5: `revalidation_service/requirements.txt` fixed to real `httpx`~~ => **PATCHED:** all manifests `httpx >= 0.27.0`; CI also runs revalidation suite (N-G4).
+- ~~m1 (Gamma side): normalizer + revalidation `/health` now return `{"status":"ok","service":...}`~~ (Alpha shape still divergent).
+- ~~m7 (Gamma side): `connectors.db` untracked and removed from the repo~~ (Delta + Beta secrets remain).
 
-**Still present / partially open from `conflict.md`:** B11 (all APIs unauth except webhook HMAC); M1 (default 8000 collision remains), M3 (class-registry triplicated + `schema_engine/` duplicate), M6, M9, M12; m1, m4 (sub-dirs), m5 (root+ocsf_normalizer), m7 (`connectors.db` committed, 32 KB, in git index).
+**Still present / partially open from `conflict.md`:** B11 (all APIs unauth except webhook HMAC); M6 (cross-pod pin divergence - Gamma manifests now internally consistent), M9, M12; m1 (cross-pod - only Alpha's `{"status":"healthy"}` shape remains). (M1/M3/M5/m4/m5/m7 Gamma sides resolved - see Patched list above.)
 
 **New conflicts (Gamma):**
 
-- **N-G1 (BLOCKER):** Nested `schema_engine/` is a full duplicate pod (141 tracked files mirroring root `app/`/`src/`/`ocsf_normalizer/`/`revalidation_service/`/`contracts/`/`shared_registry/`). Same routes exist 2-3x; any fix must land in both or they drift.
-- **N-G2 (MAJOR):** `frontend/node_modules/` is committed (2,267 tracked files) - massively bloats repo/CI.
-- **N-G3 (MINOR):** README drift - still claims `publish_contract.py` writes to `shared_registry/v1/` and documents a removed scheduler (script now writes `contracts/`).
-- **N-G4 (BLOCKER):** CI cannot pass - root installs `httpx2==2.10.0` then `pytest` runs `ocsf_normalizer/tests` needing real `httpx`; test paths duplicated across copies.
-- **N-G5 (MAJOR):** Port plan inconsistent - Dockerfile runs revalidation on `8003` only, frontend proxies to `8000` (`frontend/vite.config.js:10`), README uses default 8000.
-- **N-G6 (MINOR):** Empty `.dockerignore` files (0 B) at root and `schema_engine/` - image builds would copy `.git/` and `node_modules/`.
-- **N-G7 (MINOR):** Odd artifacts: `app/__init__.py.py`, `app/models/__init__.py.py`, `alembic/versions/0001_create_custom_ocsf_classes_table.py.py`, `schema_engine/requirements.txt.txt` (0 B).
-- **N-G8 (MINOR):** `.coverage` binaries committed at root and inside `schema_engine/`.
+- ~~**N-G1 (BLOCKER):** Nested `schema_engine/` is a full duplicate pod (141 tracked files mirroring root `app/`/`src/`/`ocsf_normalizer/`/`revalidation_service/`/`contracts/`/`shared_registry/`). Same routes exist 2-3x; any fix must land in both or they drift.~~ **PATCHED (2026-09-24):** entire `schema_engine/` subtree + root duplicate `app/`/`alembic/`/`Dockerfile`/`docker-compose.yml` deleted; `ocsf_normalizer/` + `revalidation_service/` are canonical. Also closes M3 Gamma half.
+- ~~**N-G2 (MAJOR):** `frontend/node_modules/` is committed (2,267 tracked files) - massively bloats repo/CI.~~ **PATCHED (2026-09-24):** untracked (git-ignored via `frontend/.gitignore`).
+- ~~**N-G3 (MINOR):** README drift - still claims `publish_contract.py` writes to `shared_registry/v1/` and documents a removed scheduler (script now writes `contracts/`).~~ **PATCHED (2026-09-24):** README aligned (ports 8005/8006/5174, `contracts/` publish path, scheduler refs dropped). Also resolves M5 README half.
+- ~~**N-G4 (BLOCKER):** CI cannot pass - root installs `httpx2==2.10.0` then `pytest` runs `ocsf_normalizer/tests` needing real `httpx`; test paths duplicated across copies.~~ **PATCHED (2026-09-24):** `httpx>=0.27.0` everywhere; CI also runs the revalidation suite. Also resolves m5.
+- ~~**N-G5 (MAJOR):** Port plan inconsistent - Dockerfile runs revalidation on `8003` only, frontend proxies to `8000` (`frontend/vite.config.js:10`), README uses default 8000.~~ **PATCHED (2026-09-24):** normalizer 8005 / revalidation 8006 / frontend 5174 -> 8005. Also resolves M1 Gamma half.
+- ~~**N-G6 (MINOR):** Empty `.dockerignore` files (0 B) at root and `schema_engine/` - image builds would copy `.git/` and `node_modules/`.~~ **PATCHED (2026-09-24):** root/schema_engine stubs deleted; per-service non-empty `.dockerignore` added (m4).
+- ~~**N-G7 (MINOR):** Odd artifacts: `app/__init__.py.py`, `app/models/__init__.py.py`, `alembic/versions/0001_create_custom_ocsf_classes_table.py.py`, `schema_engine/requirements.txt.txt` (0 B).~~ **PATCHED (2026-09-24):** all removed.
+- ~~**N-G8 (MINOR):** `.coverage` binaries committed at root and inside `schema_engine/`.~~ **PATCHED (2026-09-24):** untracked.
 
 ### Pod Delta - `cybreach_pod_delta/`
 
