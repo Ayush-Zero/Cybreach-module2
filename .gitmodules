@@ -7,3 +7,6 @@
 [submodule "cybreach_pod_beta"]
 	path = cybreach_pod_beta
 	url = https://github.com/gadugulalakshmi/cybreach-module2-pod-beta
+[submodule "cybreach_pod_alpha"]
+	path = cybreach_pod_alpha
+	url = https://github.com/alvinalobo/VALIDATOR.git
