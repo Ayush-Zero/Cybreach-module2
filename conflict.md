@@ -1,16 +1,17 @@
 # CyBreach Module 2 - Cross-Pod Integration Conflicts
 
-- **Date:** 2026-09-22 (Original review) | **Updated:** 2026-09-24 (Post-audit status appended; Gamma pod advanced to `452ed18` and its fixes annotated)
+- **Date:** 2026-09-29 (re-verified against the pod working trees)
 - **Scope:** Pod integration readiness review for Module 2 (The Validator)
 - **Plan source:** `CyBreach_Module2_TheValidator_TextOnly.pdf` (authoritative spec: services, contracts, API surface, topics, security, credits)
-- **Method:** Static compatibility review across all four pod repositories; each finding cites the files involved and the plan section it violates. On 2026-09-24 every pod was re-audited against its current HEAD and every conflict annotated with a live status (`PATCHED` / `PARTIAL` / `STILL PRESENT`).
+- **Method:** Static compatibility review across all four pod repositories; each finding cites the files involved and the plan section it violates.
+- **Revision note (2026-09-29):** this file now lists **open work only**. Every conflict that was previously recorded as `PATCHED` was re-checked against the pod repositories and deleted here only where the code actually satisfies it. Four previously-`PATCHED` items did not survive re-verification and have been returned to the open list with the contradicting evidence: **B13** (`POST /api/v2/validate` does not exist - the route is still `/api/v2/validator/validate`), **m8** (the 422 conversion was never implemented; `MalformedRuleQuery` is raised and never caught), **M6** (Gamma's root manifest regressed to a loose pin set, and Delta's were never bumped to match), and Delta's "one payload for all transports" (true, but `dashboard_service.py:27` still joins a string hash against an integer - now **B6/N-D18**). Claims that verification could not substantiate were downgraded rather than removed.
 
 ## Pod -> Directory Mapping (from plan Section 7)
 
 | Pod | Plan ownership | Repository directory |
 | --- | --- | --- |
-| Alpha | Rule Ingestion + Connector Framework | `VALIDATOR/` |
-| Beta | Validation Engine + Outcome Classifier | `cybreach-module2-pod-beta/` |
+| Alpha | Rule Ingestion + Connector Framework | `cybreach_pod_alpha/` |
+| Beta | Validation Engine + Outcome Classifier | `cybreach_pod_beta/` |
 | Gamma | OCSF Normalizer + Re-Validation Service | `cybreach_pod_gamma/` |
 | Delta | Verdict Publisher + Frontend Dashboard + API Gateway | `cybreach_pod_delta/` |
 
@@ -20,223 +21,162 @@
 - **[MAJOR]** - Will require meaningful rework or cause runtime failure in a shared environment.
 - **[MINOR]** - Cosmetic / hygiene issue that should be normalized but does not block integration.
 
-> **Post-audit status legend (added 2026-09-24):** under each conflict a `**Status**` line reports the live state.
-> - `PATCHED` - resolved; shown with strikethrough so teams know it is done.
-> - `PARTIAL` - some pod(s)/portion(s) fixed (strikethrough marks the fixed portion); remainder open.
-> - `STILL PRESENT` - not touched; same state as the original review.
+> **Status values used below:** `STILL PRESENT` - not addressed since the original review. `PARTIAL` - some portion fixed; the open remainder is stated explicitly. There is no `PATCHED` state, because anything fully resolved has been removed from this file.
 
 ---
 
 ## Section 1 - Blockers
 
-### B1. No pod implements the plan's message-bus topics or naming
+### B1. No shared message bus is provisioned, and nothing consumes `cybreach.evidence.v1`
 
 - **Violates:** plan Section 5 "Message Bus Topics" (`cybreach.evidence.v1`, `cybreach.verdicts.v2`, `cybreach.gap_closed.v2`, `cybreach.revalidation.v1`, `cybreach.connector.health.v1`).
-- **Impact:** There is no single shared Kafka bus / topic contract. Beta's publisher is a mock HTTP endpoint (`cybreach-module2-pod-beta/services/verdict_publisher/vp_app/main.py`), Delta uses ad-hoc topics `verdict-events` / `evidence-events` (`cybreach_pod_delta/backend/app/kafka/config.py`). Nothing matches the plan topic names; Modules 3/4 cannot wire in.
-- **Resolution:** Define one shared topic manifest per plan Section 5; all pods produce/consume only those names.
-- **Status (2026-09-24):** STILL PRESENT. No `cybreach.*` topic string exists in any pod's code (only in docs/spec + two Beta docstrings in `ve_app/ingestion.py`). Delta still publishes to `verdict-events` / consumes `evidence-events` (`cybreach_pod_delta/backend/app/kafka/producer.py:20,35,51`, `config.py:3`). Beta publisher is still a mock HTTP `POST /publish` that only prints.
+- **Where:** All five topic names are now declared in two independent manifests that were written separately and agree only by hand - Delta `cybreach_pod_delta/backend/app/kafka/config.py:16-31` and Gamma `cybreach_pod_gamma/revalidation_service/src/core/config.py:18-32` (env-overridable). Beta produces `cybreach.evidence.v1` and `cybreach.verdicts.v2` through a real lazy Kafka producer (`cybreach_pod_beta/services/verdict_publisher/vp_app/main.py:37-38,50-76,155-156`). Delta's duplicate root `verdict-publisher/` service is deleted, so `verdict-events` no longer exists in code.
+- **Impact:** The topic *names* now agree but there is no single bus behind them. **No pod subscribes to `cybreach.evidence.v1`** - Beta's `services/validation_engine/ingestion.py:30-80` replays a local JSON fixture file and never opens a `KafkaConsumer`, so the plan's first data-flow step has no implementation. No root `docker-compose.yml` exists anywhere in the workspace, so the plan's "one shared bus" has nothing to boot: the only composes are pod-local (`cybreach_pod_beta/docker-compose.yml`, `cybreach_pod_gamma/docker-compose.yml`, `cybreach_pod_delta/docker-compose.yml` - Kong only). The two hand-written topic manifests are a duplication risk of exactly the kind this conflict exists to prevent, and each pod still defaults its own broker address (Delta `app/kafka/config.py:12` `KAFKA_BOOTSTRAP_SERVERS` -> `localhost:9092`). Delta's own runbooks still document the deleted service: `docs/DEPLOYMENT_GUIDE.md:429,533,953,1015,1183` and `docs/OPERATIONS_RUNBOOK.md:431,481` still say `verdict-events`, and `DEPLOYMENT_GUIDE.md:71,441,913,925,965` still points at the deleted `verdict-publisher/`.
+- **Resolution:** One shared topic manifest owned by the integration environment, one root infra compose (KRaft Kafka + PostgreSQL + Redis), and a real `cybreach.evidence.v1` consumer in Beta's Validation Engine.
+- **Status:** PARTIAL. Names agreed and the duplicate publisher removed; the bus, the subscriber and the shared manifest do not exist.
 
-### B2. Three mutually incompatible "verdict" shapes, none matching the plan's v2.0 contract
+### B2. Alpha's verdict contract is not the frozen v2.0 contract
 
 - **Violates:** plan Section 9 "Verdict Event (publish, v2.0)": `action_id, verdict, confidence, causal_chain, mttd_seconds, matched_evidence_ref, regulatory_control_refs, content_hash`.
-- **Shapes found:**
-  1. `VALIDATOR/contracts/verdict schema/verdict_schema.json` - has `action_id, verdict, confidence, mttd_seconds, matched_evidence_ref, causal_chain, rule_id, technique_ref`; **missing** `regulatory_control_refs`, `content_hash`.
-  2. Beta `cybreach-module2-pod-beta/services/validation_engine/ve_app/models.py:30-46` and `services/verdict_publisher/vp_app/models.py:6-14` - has `integrity_hash` instead of `content_hash`, **missing** `regulatory_control_refs`.
-  3. Delta `cybreach_pod_delta/contracts/verdict-event/verdict.schema.json` - `rule_id, rule_name, verdict, event_data, verdict_hash, created_at`; structurally different (no `action_id`, no `confidence`, no `causal_chain`).
-- **Impact:** No two pods even serialize a verdict the same way; a cross-pod verdict cannot be validated end-to-end.
-- **Resolution:** One frozen `verdict.schema.json` per plan v2.0, owned by Delta (publisher); Alpha/Beta/Gamma build against it.
-- **Status (2026-09-24):** STILL PRESENT. All three shapes unchanged. Grep for `content_hash` / `regulatory_control_refs` across the entire workspace: 0 matches in code/schemas.
+- **Where:** Delta owns the frozen contract and enforces it at runtime - `cybreach_pod_delta/contracts/verdict-event/verdict.schema.json:7-54` (8 properties, all 8 `required`, `additionalProperties: false`, `confidence` bounded 0.0-1.0), loaded and enforced on every publish by `backend/app/contracts/verdict_event.py:33-34,98-106` via `backend/app/kafka/producer.py:67`. Beta emits the same 8 fields under the same name (`content_hash`, not the old `integrity_hash`) - `services/verdict_publisher/vp_app/main.py:96,123-128` and `services/validation_engine/ve_app/models.py:50` - and the digest agreement is proven byte-identical at `services/validation_engine/tests/test_verdict_integrity.py:163-192`. **Alpha still ships the pre-v2.0 shape**: `cybreach_pod_alpha/contracts/verdict schema/verdict_schema.json:7-63` has 8 properties but only 5 `required` and **omits `regulatory_control_refs` and `content_hash` entirely**.
+- **Impact:** Two of four pods can exchange a contract-valid verdict; Alpha's schema cannot accept one and cannot produce one, so a rule ingested from Alpha cannot be traced to a verdict that satisfies the frozen contract.
+- **Resolution:** Alpha adopts the frozen v2.0 field list and adds a conformance test that validates a Delta- or Beta-produced event against it.
+- **Status:** PARTIAL. Delta and Beta conform; Alpha does not.
 
-### B3. Delta publishes to Kafka a payload that violates even its own published contract
+### B6. `rule_id` type and derivation still disagree, and one Delta join still mixes the two
 
-- **Violates:** plan Section 5 topic `cybreach.verdicts.v2`; Delta contract `cybreach_pod_delta/contracts/verdict-event/verdict.schema.json`.
-- **Where:** `cybreach_pod_delta/backend/app/api/validator.py:54-61` publishes `{rule_id, rule_name, status, confidence, matched_fields, event}` - key `status` instead of `verdict`, `event` instead of `event_data`, and **missing required** `verdict_hash` and `created_at`. The corrected payload in `cybreach_pod_delta/backend/app/services/verdict_service.py:116-125` is yet a third shape (`id`, `supersedes`).
-- **Impact:** Any consumer validating against the published schema rejects every event.
-- **Resolution:** Publish exactly the contract schema; single serialization path reused by API, WebSocket, and Kafka.
-- **Status (2026-09-24):** STILL PRESENT. `validator.py:54-61` and `verdict_service.py:116-125` unchanged; a third bespoke gap-closed payload also exists in `revalidation_service.py:130-144`.
-
-### B4. Delta hardcodes the rule identity in validate
-
-- **Violates:** plan Section 5 `POST /api/v2/validate`.
-- **Where:** `cybreach_pod_delta/backend/app/api/validator.py:32-34` - `rule_id=1`, `rule_name="Suspicious PowerShell"` regardless of request. Also `cybreach_pod_delta/backend/app/api/validator.py:55-56` repeats the hardcode in the Kafka payload.
-- **Impact:** Verdicts cannot be joined to ingested rules across pods; all activity attributed to one fake rule.
-- **Resolution:** Thread real `rule_id`/`rule_name` from the rule store through validation.
-- **Status (2026-09-24):** STILL PRESENT. Same hardcoded `rule_id=1` / `"Suspicious PowerShell"` at `validator.py:33-34` and `:55-56`.
-
-### B5. Confidence scale mismatch (0.0-1.0 vs 0-100)
-
-- **Violates:** plan Section 2 / Section 3.3 "Confidence scores (0.0 to 1.0)"; plan Verdict Schema `confidence` 0.0-1.0.
-- **Where:** Beta `cybreach-module2-pod-beta/services/verdict_publisher/vp_app/models.py:9` and `ve_app/models.py:37` constrain `0.0-1.0`; Delta returns `confidence: 95` in `cybreach_pod_delta/backend/app/services/validator_service.py:67`.
-- **Impact:** Feeding Delta output into Beta's `/publish` fails pydantic validation (`le=1.0`).
-- **Resolution:** Centralize confidence normalization at 0.0-1.0 in the shared schema.
-- **Status (2026-09-24):** STILL PRESENT. Beta still constrains `ge=0.0, le=1.0`; Delta still returns `confidence: 95` (`validator_service.py:67`).
-
-### B6. `rule_id` type mismatch (string vs integer)
-
-- **Violates:** plan Section 8 tech-stack/db schema `detection_rules (rule_id, ...)`; cross-pod traceability guarantee.
-- **Where:** Alpha `VALIDATOR/rule ingestion/app/models/rule_models.py:114` (`ParsedRule.rule_id: str`); Beta `ve_app/models.py:41` (`rule_id: str`); Delta `cybreach_pod_delta/backend/app/models/rule.py:9`, `verdict.py:19` (`Integer`), and `/rules/{rule_id}` typed `int`.
-- **Impact:** A rule produced by Alpha cannot be referenced by Delta's integer key; joins across pods break.
-- **Resolution:** Freeze `rule_id` as one canonical type (string, content-hash based per plan) in the shared verdict/rule schema.
-- **Status (2026-09-24):** STILL PRESENT. Alpha/Beta still `str`; Delta still `Integer` everywhere (`models/rule.py:9`, `models/verdict.py:19`, `rules.py:72,89,175,230,251`).
+- **Violates:** plan Section 8 tech-stack/db schema `detection_rules (rule_id, ...)`; the cross-pod traceability guarantee.
+- **Where:** Delta's verdict-side surface is now string-keyed on the canonical content hash: `Rule.rule_id` is `String(64) unique` (`cybreach_pod_delta/backend/app/models/rule.py:14`), `Verdict.rule_id` is `String(64)` with a foreign key onto it (`app/models/verdict.py:43`), the response type is `str` (`app/schemas/verdict.py:13`), and both dashboard services declare `rule_id: string` (`frontend-dashboard/src/services/verdictService.ts:10`, `revalidationDashboardService.ts:8`). `app/services/causal_chain_service.py:24` now joins `Rule.rule_id == verdict.rule_id` instead of comparing a hash to an int, so `/verdicts/{id}/chain` can match.
+- **Where (still open):** the same int-vs-hash bug **survives in a second place** - `app/services/dashboard_service.py:27` still joins `Verdict.rule_id == Rule.id`, i.e. a 64-char hash against an integer surrogate, so `/dashboard/coverage` cannot join. And Alpha never adopted the canonical id at all: `cybreach_pod_alpha/rule ingestion/app/api/rules.py:180` assigns `rule_id=parsed_dict.get("rule_id") or "UNKNOWN"`, with the content hash written to a *separate* field at `:184`. Alpha's model types `rule_id` as a free-form required `str` up to 255 chars (`app/models/rule_models.py:114-119`), so nothing forces it to be the digest Beta and Delta now key on. Delta's own `/rules/{rule_id}` routes still key on the integer surrogate `Rule.id`, which is correct - that is Delta's rule-management surface, not a cross-pod identity.
+- **Impact:** A rule produced by Alpha is keyed by a string Beta and Delta do not compute; `dashboard_service` additionally cannot join its own tables.
+- **Resolution:** Freeze `rule_id` as the content-hash string in the shared schema; fix `dashboard_service.py:27`; make Alpha assign the digest.
+- **Status:** PARTIAL. Delta's schema and dashboard types conform; one Delta join and all of Alpha do not.
 
 ### B7. Service ownership conflict vs plan Section 7
 
 - **Violates:** plan Section 7 team structure (Verdict Publisher + Dashboard + Gateway = Delta; Connector Framework = Alpha).
-- **Where:** Beta ships a duplicate `services/verdict_publisher` (`cybreach-module2-pod-beta/services/verdict_publisher/`) - Delta's job; Beta also ships its own `BaseConnector`/connector framework (`cybreach-module2-pod-beta/services/validation_engine/ve_app/connectors.py`) and a local `DetectionRule` stand-in - Alpha's job. Delta ships `/rules`, `/connectors`, `/validator/validate` (`cybreach_pod_delta/backend/app/api/`) - Alpha's and Beta's jobs.
-- **Impact:** Two implementations per responsibility with divergent behavior; overnight ownership ambiguity in integration.
-- **Resolution:** Enforce one owner per service per plan Section 7; retire duplicate implementations (contract tests on the keeper).
-- **Status (2026-09-24):** STILL PRESENT. No duplicate retired: Beta still ships `services/verdict_publisher/` (3 test files) + `ve_app/connectors.py` (imported by `rule_execution.py:8`); Delta still exposes `/rules`, `/connectors`, `/validator/validate`.
+- **Where:** Beta ships a duplicate `services/verdict_publisher/` (3 test files, `cybreach_pod_beta/services/verdict_publisher/`) - Delta's job - and still ships its own `BaseConnector` framework at `services/validation_engine/ve_app/connectors.py`, imported by `rule_execution.py:8` and used at `:117,129-130`, plus a local `DetectionRule` stand-in (`ve_app/main.py:29-42`) - Alpha's job. Delta ships `/rules`, `/connectors`, `/validator/validate` (`cybreach_pod_delta/backend/app/api/`) - Alpha's and Beta's jobs.
+- **Impact:** Two implementations per responsibility with divergent behavior; ownership is ambiguous at integration time.
+- **Resolution:** Enforce one owner per service per plan Section 7; retire the duplicates (contract tests on the keeper).
+- **Status:** STILL PRESENT. Nothing retired.
 
-### B8. Rule ingestion -> validation engine wiring is unimplemented
+### B8. Rule ingestion -> validation engine wiring depends on Alpha process memory
 
-- **Violates:** plan Section 5 data flow step (2) "Rule Ingestion sends parsed detection rules to the Validation Engine via internal gRPC"; plan Section 9 Rule content hashing.
-- **Where:** Alpha exposes `POST /api/v2/rules/ingest` (REST) and stores rules in an **in-memory dict** `VALIDATOR/rule ingestion/app/api/rules.py:78` (its own `detection_rules` migration `VALIDATOR/rule ingestion/alembic/versions/001_create_detection_rules.py` is never used). Beta has no HTTP/gRPC client to any rules API (`cybreach-module2-pod-beta/services/validation_engine/ve_app/main.py:25-37` defines a local `DetectionRule`).
-- **Impact:** No rule delivery seam exists; nothing ships "parsed rules" to the engine at integration time.
-- **Resolution:** Implement the plan's gRPC rule-delivery channel (or an agreed REST `GET /api/v2/rules` + content-hash lookup) and make Beta consume Alpha, not a local stand-in.
-- **Status (2026-09-24):** PARTIAL. In-memory dict + no `GET /api/v2/rules` list route + no gRPC still true. Improvement: Alpha's alembic `001_create_detection_rules.py` is now a real revision (driven by an offline-mode test in `tests/test_alembic_migrations.py`), but the service still never writes rules to the DB at runtime.
+- **Violates:** plan Section 5 data flow step (2) - "Rule Ingestion sends parsed detection rules to the Validation Engine via internal gRPC"; plan Section 9 rule content hashing.
+- **Where:** Alpha exposes `POST /api/v2/rules/ingest` and `GET /api/v2/rules` (`cybreach_pod_alpha/rule ingestion/app/api/rules.py:21,221-224`) and Beta has a matching client and mapper (`cybreach_pod_beta/services/validation_engine/ve_app/main.py:46-73`, invoked at `:233` when a single request supplies no rules). But the store Alpha serves from is a plain module-level dict: `rule ingestion/app/api/rules.py:77-78` `INGESTED_RULES: Dict[str, ParsedRule] = {}`, mutated only at `:196`. No route in `app/api/` opens a DB session; the `detection_rules` table that Alpha's own migration creates is never read at runtime, and the same pattern holds for the versioning store (`rule_versioning.py:254`) and the dependency tracker (`rule_dependency_tracker.py:43`).
+- **Impact:** Any Alpha restart silently empties the rule set and Beta degrades to `NoData` for every evidence event. Alpha's own test at `tests/test_alembic_migrations.py:55,59` proves the migration runs offline, which makes the in-memory divergence easy to miss. Two further breaks in the seam: the mapper coerces `detection_logic` with `str()` (`ve_app/main.py:60-68`) while Alpha types it `Union[Dict[str, Any], str]` (`app/models/rule_models.py:157`) - for a Sigma rule that turns a rule body into a Python-repr string, not a query; and Alpha's Dockerfile and README bind the service to **8000** (`rule ingestion/Dockerfile:9,11`, `app/README.md:26,39,75,105`) while Beta's client defaults to `http://127.0.0.1:8001/api/v2/rules` (`ve_app/main.py:47`) and the port registry assigns Alpha 8001 (`port-registery.md:13`), so the client cannot reach a default Alpha build. Batch validation still bypasses Alpha entirely (`ve_app/main.py:237-244` uses `req.rules` only, with no fetch and no fallback), the `DetectionRule` stand-in remains, fetch failures propagate with no fallback, and no gRPC seam exists.
+- **Resolution:** Serve the collection route from the existing `detection_rules` table; reconcile the port; make Beta use Alpha for batch and caller-supplied flows; stop string-coercing `detection_logic`; define fetch-failure behavior; retire the stand-in or document the drift.
+- **Status:** PARTIAL. The route and client exist and match on field names; persistence, the port, the coercion and the batch path do not.
 
-### B9. Delta's evidence consumer expects a shape that matches no producer and not the frozen EvidenceEvent contract
+### B10. No single Kafka stack is provisioned for the hybrid run
 
-- **Violates:** plan Section 9 "Evidence Event (consume, v1.0)"; plan Section 2 frozen contract.
-- **Where:** `cybreach_pod_delta/backend/app/consumers/consumer.py:45-46` reads `data["rule_id"]` and `data["event"]` from topic `evidence-events`. Frozen contract `cybreach-module2-pod-beta/contracts/evidence_event_schema.json` has only `action_id, correlation_key, technique_ref, target_asset_ref, expected_observable, timestamp` - no `rule_id`/`event`. No pod publishes to `evidence-events` at all.
-- **Impact:** The consume path crashes with `KeyError` the moment a real Module-1 event arrives; also wrong owner (plan: Validation Engine consumes evidence, not the delta publisher).
-- **Resolution:** Consume the frozen v1.0 EvidenceEvent on `cybreach.evidence.v1` in the Validation Engine; remove the mis-shaped delta consumer.
-- **Status (2026-09-24):** STILL PRESENT. `consumers/consumer.py:43-47` unchanged; a second duplicate consumer `kafka/consumer.py:7-27` does the same; both read `rule_id`/`event` off `evidence-events`.
+- **Violates:** plan Section 8 "Kafka/Redpanda (latest)" as a single message bus; plan Section 5.
+- **Where:** Delta's ZooKeeper + Kafka services were removed from its compose, so `9092` is no longer contested and Beta's KRaft broker is the only one declared. But nothing owns the broker: there is no root `docker-compose.yml` in the workspace, and both `cybreach_pod_delta/backend/app/kafka/config.py:12` and Gamma's config default to a local address rather than an injected one for the shared environment.
+- **Impact:** The port collision is gone but the plan's "one shared bus" is still unprovisioned, so B1's empty evidence seam cannot be closed by configuration alone.
+- **Resolution:** One shared KRaft stack owned by the integration environment; all pods point at it by injected URL.
+- **Status:** PARTIAL. Collision resolved; the stack does not exist.
 
-### B10. Kafka 9092 port/topology collision between Beta and Delta stacks
-
-- **Violates:** plan Section 8 "Kafka/Redpanda (latest)" single message bus; plan Section 5.
-- **Where:** Beta `cybreach-module2-pod-beta/docker-compose.yml:36-61` = KRaft broker+controller (no ZooKeeper); Delta `cybreach_pod_delta/docker-compose.yml:14-27` = ZooKeeper mode. **Both** bind host `9092` (`...- "9092:9092"`).
-- **Impact:** The two compose stacks cannot run simultaneously; whichever starts second fails on port bind; incompatible topologies anyway.
-- **Resolution:** One shared Kafka stack (recommended KRaft per beta) owned by the integration environment; all pods point at it.
-- **Status (2026-09-24):** STILL PRESENT. Beta `docker-compose.yml:41` still `9092:9092` KRaft; Delta `docker-compose.yml:20-21` still ZooKeeper mode binding `9092:9092`.
-
-### B11. Security model violated (plan mandates JWT + tenant scoping)
+### B11. Security model: Alpha/Beta/Gamma unauthenticated, and tenant scoping absent everywhere
 
 - **Violates:** plan Section 5 "Security Model"; plan API endpoint list "all ... (JWT)"; plan code-review checklist "No hardcoded secrets".
-- **Where:** Alpha, Beta, Gamma expose **unauthenticated** APIs (no auth anywhere in `VALIDATOR/rule ingestion/app/`, `cybreach-module2-pod-beta/services/*/.../app/`, `cybreach_pod_gamma/...`). Delta has JWT but with hardcoded credentials `admin/admin123` (`cybreach_pod_delta/backend/app/api/auth.py:14-15`).
-- **Impact:** Zero-trust posture (JWT everywhere, tenant-scoped) not met in 3 of 4 pods; hardcoded creds violate the review checklist.
-- **Resolution:** Shared JWT middleware/issuer; enforce on every `/api/v2` route; credentials via env/vault only.
-- **Status (2026-09-24):** STILL PRESENT. Alpha/Beta/Gamma remain fully unauthenticated (0 auth deps/middleware found); Delta still hardcodes `admin/admin123` (`auth.py:14-15`) and `SECRET_KEY = "cybreach_validator_secret_key"` (`security.py:9`). Gamma's only guarded route is `/api/v2/webhook/ingest` (per-connector HMAC, not shared JWT).
+- **Where:** Delta enforces JWT on every route outside a 3-entry public allowlist (`POST /api/v2/auth/login`, `GET /`, `GET /health`), with a 3-entry allowlist declared in `backend/tests/test_auth_coverage.py:33-38` and enforced on the assembled OpenAPI schema; secrets are env-only with no fallback (`app/api/auth.py:21-22,33-40`, `app/security/security.py:18,27-36`); the verdict WebSocket verifies its token before joining the broadcast set (`app/main.py:90-98`). **Alpha, Beta and Gamma remain fully unauthenticated** - zero `Depends(...)`, `add_middleware`, `OAuth2`, `APIKeyHeader` or `Authorization` references in any of the three. Alpha's whole surface is open (`cybreach_pod_alpha/rule ingestion/app/main.py:73-102`), as is all of Beta's (`/validate`, `/validate/batch`, `/classify`, `/publish`) and Gamma's, with one exception: Gamma's `/api/v2/webhook/ingest` is guarded by a per-connector shared secret or HMAC-SHA256 with a constant-time compare (`cybreach_pod_gamma/ocsf_normalizer/src/main.py:236-289`, `webhook/security.py:48-65`).
+- **Impact (two distinct gaps):**
+  1. **No tenant scoping anywhere in the workspace.** There is no `tenant_id` column on any table in any pod and no tenant filtering on any query, so the plan's tenant-scoping requirement is entirely unimplemented - including in Delta, whose authentication half is otherwise done. This is a schema migration plus per-query scoping, not a route guard.
+  2. **Gamma's connector self-registration is open.** `POST /api/v2/webhook/connectors` (`ocsf_normalizer/src/main.py:393-417`) is unauthenticated, so any caller can register a connector with a self-chosen secret and then ingest through it - the HMAC guard on `ingest` is only as strong as an unauthenticated registration endpoint.
+- **Resolution:** Shared JWT middleware/issuer enforced on every `/api/v2` route in all four pods; authenticate Gamma's connector registration; add `tenant_id` and per-query scoping as a migration, not a guard.
+- **Status:** PARTIAL. Delta's route-level authentication is done and test-gated; tenant scoping is untouched in every pod, and Alpha/Beta/Gamma have no authentication at all.
 
 ### B12. Incompatible `BaseConnector` implementations
 
 - **Violates:** plan Section 3.2 Connector Framework (single pluggable framework, read-only `query()/poll()`).
-- **Where:** Beta `cybreach-module2-pod-beta/services/validation_engine/ve_app/connectors.py:20` `BaseConnector.__init__(self, config: Dict[str, Any] | None)`; Alpha `VALIDATOR/rule ingestion/app/connector/base_connector.py:20,30` `BaseConnector(config: ConnectorConfig)` (pydantic) plus resilience layer (`ConnectorResilience`).
+- **Where:** Beta `cybreach_pod_beta/services/validation_engine/ve_app/connectors.py:23` declares `BaseConnector.__init__(self, config: Dict[str, Any] | None)`; Alpha `cybreach_pod_alpha/rule ingestion/app/connector/base_connector.py:12-20` declares a pydantic `ConnectorConfig` plus a `ConnectorResilience` layer (`app/connector/resilience.py:13`, wired at `base_connector.py:41`).
 - **Impact:** Alpha's connectors (Splunk/Sentinel/Elastic/QRadar/CrowdStrike) cannot be dropped into Beta's engine; two frameworks diverge.
-- **Resolution:** Alpha's connector framework is the keeper (it owns the 5 connectors); Beta's engine consumes it via the shared interface/registry - delete beta's `connectors.py`.
-- **Status (2026-09-24):** STILL PRESENT. Alpha interface unchanged (pydantic `ConnectorConfig` + `ConnectorResilience`); Beta `ve_app/connectors.py` still exists and is required (`rule_execution.py:8` imports `BaseConnector` from it).
+- **Resolution:** Alpha's framework is the keeper; Beta's engine consumes it via the shared registry - delete Beta's `connectors.py`.
+- **Status:** STILL PRESENT. Alpha's interface is unchanged; Beta's `ve_app/connectors.py` still exists and is a hard import for `rule_execution.py`.
 
-### B13. REST API surface diverges from plan's `/api/v2/*` design
+### B13. REST API surface diverges from the plan's `/api/v2/*` design
 
 - **Violates:** plan Section 5 "API Endpoints" (all `/api/v2/...` with JWT).
-- **Where:** Alpha/Gamma use `/api/v2/*`; Beta uses bare `/validate`, `/classify`, `/publish`; Delta uses bare `/rules`, `/verdicts`, `/validator/validate`, `/connectors` and its gateway `cybreach_pod_delta/api-gateway/kong.yml` only routes bare paths (no `/api/v2` routes). `kong.yml:5` points upstream at `host.docker.internal:8033`, while all delta docs/frontend use port 8000 (`cybreach_pod_delta/frontend-dashboard/src/services/api.ts:4`) - internally contradictory.
-- **Impact:** A unified gateway cannot front Alpha/Gamma (which use `/api/v2`) and Delta/Beta (bare) without route rework; delta's own gateway upstream contradicts its backend port.
-- **Resolution:** Standardize all endpoints under `/api/v2/*`; gateway routes `/api/v2` to the relevant service; fix upstream to the real backend port.
-- **Status (2026-09-24):** STILL PRESENT. Beta routes still bare (`/validate` `ve_app/main.py:188`, `/classify` `oc_app/main.py:46`, `/publish` `vp_app/main.py:43`); Delta routes still bare and `kong.yml:5` still `host.docker.internal:8033` while `frontend-dashboard/src/services/api.ts:4` uses `127.0.0.1:8000`.
+- **Where:** Delta mounts every router under `/api/v2` (`cybreach_pod_delta/backend/app/main.py:66-73`) and Kong routes a single `/api/v2` path, with the upstream repointed to the backend's real port `8000` (`api-gateway/kong.yml:11`); the duplicate gateway compose is deleted, so one registry-consistent gateway on `8010`/`8011` remains. Alpha and Gamma also use `/api/v2` prefixes. **Two things are still wrong.** First, `POST /api/v2/validate` does **not** exist: `backend/app/api/validator.py:18` still sets `prefix="/validator"` and `:24` declares `@router.post("/validate")`, so the route is `POST /api/v2/validator/validate`. A previous revision of this file recorded the nesting as removed; it was not, and no `/api/v2/validate` string exists anywhere in the repository. Second, Beta's routes are unversioned - `ve_app/main.py:231,237,247`, `oc_app/main.py:50,85`, `vp_app/main.py:131,167` - with no `APIRouter` or `include_router` anywhere in Beta.
+- **Impact:** A single gateway still cannot front Delta (`/api/v2`) and Beta (bare) without route rework, and the plan's documented validate endpoint is not the one implemented.
+- **Resolution:** Version all of Beta's routes under `/api/v2`; flatten `validator_router` to `POST /api/v2/validate`; add a contract test asserting the plan's endpoint list resolves.
+- **Status:** PARTIAL. Delta's prefixes, Kong's upstream and the single gateway are correct; the validate path is still nested and Beta is still bare.
 
 ---
 
 ## Section 2 - Major
 
-### M1. Port collisions in a shared environment
+### M1. Port assignments in the registry do not match what the pods bind
 
 - **Violates:** plan Section 7 local dev / Section 8 (one coherent environment).
-- **Where:**
-  - `8000` claimed by: Delta backend (docs, `cybreach_pod_delta/frontend-dashboard/src/services/api.ts:4`, `websocketService.ts:10`), Kong (`cybreach_pod_delta/docker-compose.yml:46`), Beta `vp_app` (default), Alpha docs (`VALIDATOR/rule ingestion/app/README.md:26`). ~~Gamma normalizer + revalidation (uvicorn default) - now on 8005/8006~~.
-  - `8002` claimed by: Beta Validation Engine (`cybreach-module2-pod-beta/services/validation_engine/ve_app/main.py:9`, per plan local-dev example) vs Delta Kong (`cybreach_pod_delta/api-gateway/docker-compose.yml:14`).
-  - `5173` claimed by: Delta frontend (`cybreach_pod_delta/frontend-dashboard/vite.config.ts`). ~~Gamma frontend (`cybreach_pod_gamma/frontend/vite.config.js`) - now on 5174~~.
-- **Impact:** Up to 5+ services cannot run together; frontends cannot serve simultaneously.
-- **Resolution:** Port registry per service (see reconciliation table); gateway internal porting.
-- **Status (2026-09-24, updated after gamma refetch):** PARTIAL. ~~Gamma moved its revalidation image to `8003` (`Dockerfile:10-12`, `schema_engine/Dockerfile`) but normalizer + revalidation still default to `8000` when run via uvicorn/README, and the frontend proxy still points at `8000` (`frontend/vite.config.js:10`). All other collisions unchanged. NEW: Beta Outcome Classifier also claims `8003` (`oc_app/main.py:5`) - now collides with Gamma's new 8003.~~ **Gamma side resolved:** normalizer binds `8005`, revalidation `8006` (uvicorn main guards + Dockerfiles), frontend on `5174` proxying `/api` -> `8005`; README aligned (see N-G5). REMAINS (other pods): `8000` (Delta backend/Kong, Beta `vp_app`, Alpha docs), `8002` (Beta `ve_app` vs Delta Kong), `5173` (Delta frontend). Beta `oc_app` `8003` no longer collides with Gamma.
+- **Where:** the registry (`port-registery.md:13-16,26-28`) assigns Alpha 8001, Beta 8002/8003/8004, Delta backend 8000 and Kong 8010/8011; Gamma binds 8005/8006 with its frontend on 5174. Beta now binds all three of its ports explicitly with env overrides (`ve_app/main.py:260` `VE_PORT`->8002, `oc_app/main.py:99` `OC_PORT`->8003, `vp_app/main.py:42,180` `VP_PORT`->8004) and only one gateway compose remains, so Beta and Delta no longer contend. **Alpha does not match:** `cybreach_pod_alpha/rule ingestion/Dockerfile:9,11` and `app/README.md:26,39,75,105` all bind **8000**, not the registry's 8001, so Alpha and the Delta backend both claim 8000 and Beta's default client URL (`ve_app/main.py:47`) cannot reach a default Alpha build. Gamma's frontend is on 5174 and Delta's on 5173, so the two dashboards no longer collide.
+- **Impact:** Alpha and the Delta backend collide on 8000, and the registry - the document every pod and the gateway were corrected against - is wrong about Alpha.
+- **Resolution:** Move Alpha to 8001 in its Dockerfile, README and the Beta client default, or change the registry and every reference to match; then re-check the whole set together.
+- **Status:** PARTIAL. Beta, Delta and Gamma conform; Alpha's actual port contradicts the registry and collides with the canonical publisher.
 
 ### M2. Verdict enum spelling: `NoData` vs `No Data`
 
-- **Violates:** plan ambiguity itself - glossary says `NoData`, PRD 3.4 says `No Data`; must still be reconciled once.
-- **Where:** Alpha/Beta use `NoData` (`VALIDATOR/contracts/verdict schema/verdict_schema.json:17`, beta models); Delta uses `"No Data"` (`cybreach_pod_delta/backend/app/services/revalidation_service.py:106`, `cybreach_pod_delta/frontend-dashboard/src/components/VerdictFilter.tsx:25`, docs `API_REFERENCE.md`).
-- **Impact:** Cross-pod verdict matching/filtering breaks silently.
-- **Resolution:** Pick one canonical token (recommend `NoData`), update doc + all four pods + schema enum.
-- **Status (2026-09-24):** ~~Gamma: patched~~ (Gamma source has no `NoData`/`No Data` at all; it uses `IMPROVED/DEGRADED/UNCHANGED`). Cross-pod conflict REMAINS: Alpha/Beta `NoData` vs Delta `"No Data"` (`revalidation_service.py:106`, `VerdictFilter.tsx:25`, `API_REFERENCE.md`).
+- **Violates:** plan ambiguity itself - the glossary says `NoData`, PRD 3.4 says `No Data`; it still has to be reconciled once.
+- **Where:** Beta emits canonical `NoData` (`services/validation_engine/ve_app/main.py:139`, `outcome_classifier/oc_app/main.py:54`) and normalizes legacy spellings at the publish edge (`verdict_publisher/vp_app/models.py:51-60,88-111`). Delta emits `NoData`/`Missed`/`Detected` and runs every payload through `normalize_verdict()` (`cybreach_pod_delta/backend/app/contracts/verdict_event.py:73-79`), so a row written under the old spelling still compares correctly. **Still open:** the legacy alias is retained by design in Delta's own source (`app/contracts/verdict_event.py:53`, plus comments at `:14,:36`) - that retention is correct, but the dashboard still offers the legacy token as a user-facing filter option (`frontend-dashboard/src/components/VerdictFilter.tsx:25`), and `docs/API_REFERENCE.md` still documents the old spelling. Gamma uses its own independent `IMPROVED`/`DEGRADED`/`UNCHANGED` enum (`revalidation_service/src/core/contracts.py:52`) and is not part of this conflict.
+- **Impact:** Users can still select and be shown `"No Data"` in the dashboard, and the published API reference still teaches the wrong token.
+- **Resolution:** Drop the legacy option from the dashboard filter and the old token from `API_REFERENCE.md`; keep the input-side alias in Delta's normalizer, which is a compatibility feature rather than a conflict.
+- **Status:** PARTIAL. Both publishers agree and Beta and Delta hash identical bytes; two user-facing surfaces still carry the old spelling.
 
 ### M3. Connector/registry APIs triplicated and incompatible
 
 - **Violates:** plan Section 5 `POST /api/v2/connectors/register`, `GET /api/v2/connectors/health`.
-- **Where:** Alpha `VALIDATOR/rule ingestion/app/api/connector_routes.py` (`/api/v2/connectors/*`); Delta `cybreach_pod_delta/backend/app/api/connectors*` (`/connectors`, `/connectors/{id}`); Gamma webhook connectors `cybreach_pod_gamma/ocsf_normalizer` (`/api/v2/webhook/connectors`). Alpha docs claim Gamma/Delta consume its health surface - neither does.
-- **Impact:** Three registries, three health shapes; connector health cannot be aggregated.
-- **Resolution:** Single registry per Alpha (owner of Connector Framework); others consume.
-- **Status (2026-09-24):** PARTIAL. Gamma consolidated webhook connector routes to one file (`ocsf_normalizer/src/main.py:384,411`). ~~the custom OCSF class-registry API still exists 3x (`app/routes/custom_ocsf.py`, `schema_engine/app/routes/custom_ocsf.py`, `ocsf_normalizer/src/main.py:124-224`), and the whole Gamma stack is duplicated under `schema_engine/`~~ (**Gamma side fixed:** duplicate routes + the `schema_engine/` subtree deleted - see N-G1; single registry in `ocsf_normalizer/src/main.py:124-224`). Alpha + Delta registries unchanged.
+- **Where:** Alpha `cybreach_pod_alpha/rule ingestion/app/api/connector_routes.py:12-15` (`/api/v2/connectors/*`); Delta `cybreach_pod_delta/backend/app/api/connectors.py` (`/connectors`, `/connectors/{id}`); Gamma webhook connectors `cybreach_pod_gamma/ocsf_normalizer/src/main.py:393-417` (`/api/v2/webhook/connectors`). Alpha's docs claim Gamma and Delta consume its health surface; neither does. Gamma's own duplication is resolved - the class registry exists once, at `ocsf_normalizer/src/main.py:133-233`, after the `schema_engine/` copy and `app/routes/custom_ocsf.py` were removed - but the two *other* registries are unchanged. The underlying DDL ownership is also unresolved: Gamma's `ocsf_normalizer/migration/002_webhook_connector.sql:7` creates a table named `connectors` (`id, name, secret, hmac_enabled, is_active, created_at`), while Delta has renamed its own to `platform_connector_health` (`app/models/connector.py:14`) precisely to avoid colliding with it.
+- **Impact:** Three registries, three health shapes; connector health cannot be aggregated, and two pods define connector state in tables with the same name and different columns.
+- **Resolution:** Single registry owned by Alpha; the other two consume it. Decide which pod owns the `connectors` table in a merged database.
+- **Status:** PARTIAL. Gamma's internal duplication is gone; three registries and a `connectors` DDL ownership question remain.
 
 ### M4. Rule-dependency integration is one-sided
 
-- **Violates:** plan Week 7 Alpha "rule dependency tracker"; plan Section 5 validation_runs link.
-- **Where:** Alpha exposes `POST /api/v2/rules/{rule_id}/dependencies` expecting Beta to record usage (`VALIDATOR/rule ingestion/app/api/rules.py:392`); Beta has no client that calls any rules API (local `DetectionRule` only).
-- **Impact:** Dependency graph stays empty; nothing records which rule executed against which evidence.
-- **Resolution:** Beta (engine) reports usage back to Alpha's dependency endpoint; covered by a contract test.
-- **Status (2026-09-24):** STILL PRESENT. Endpoint still at `rules.py:392`; no pod calls Alpha's rules/dependencies endpoints (grep across other pods: 0 hits).
+- **Violates:** plan Week 7 Alpha "rule dependency tracker"; plan Section 5 `validation_runs` link.
+- **Where:** Alpha exposes `POST /api/v2/rules/{rule_id}/dependencies` with `dependent_type` validated against `{validation_run, revalidation_run, action}` (`cybreach_pod_alpha/rule ingestion/app/api/rules.py:396-428`). The only callers are Alpha's own tests (`tests/test_rule_versioning.py:275,294,303`). Beta's client for Alpha is GET-only (`cybreach_pod_beta/services/validation_engine/ve_app/main.py:46-53`) and never posts usage.
+- **Impact:** The dependency graph stays empty; nothing records which rule executed against which evidence.
+- **Resolution:** Beta's engine reports usage back to Alpha's dependency endpoint; covered by a contract test.
+- **Status:** STILL PRESENT. No pod posts to that endpoint.
 
-### M5. `shared_registry/v1/` contract registry does not exist
+### M5. The cross-pod contract registry exists in three incompatible places and nothing reads it
 
 - **Violates:** plan Week 1 "Contracts Published: all frozen schemas and fixtures available in shared repo".
-- **Where:** Gamma `cybreach_pod_gamma/publish_contract.py:7` writes to `shared_registry/v1/` - directory exists **nowhere** in the workspace; nothing reads from it.
-- **Impact:** Cross-pod contract publishing mechanism is unwired; published file is an OCSF field-mapping sample, not a schema contract.
-- **Resolution:** Stand up one shared registry (root `contracts/` or the `shared_registry/v1/` dir); every pod publishes frozen schemas there and contract tests load from it.
-- **Status (2026-09-24):** PARTIAL. ~~`shared_registry/v1/windows_auth.json` now exists in Gamma (tracked)~~; `publish_contract.py` now writes to `contracts/ocsf_normalizer_schema.v1.json`. ~~README still claims the old path~~ (**Gamma side fixed:** README + `publish_contract.py` now document `contracts/` as the cross-pod publish target - see N-G3). Still unwired: nothing in any pod consumes `shared_registry/v1/` today.
+- **Where:** Gamma's `publish_contract.py:14-15,50` writes to a **pod-local** `cybreach_pod_gamma/contracts/ocsf_normalizer_schema.v1.json`, even though its own docstring at `:5` claims the workspace root. There is no `G:\Cybreach-module2\contracts` directory. `shared_registry/v1/windows_auth.json` is still tracked and read by nobody. A workspace-wide search for consumers of either path finds only prose in this file, in `integration_run_plan.md`, and in Gamma's `README.md:25,177`.
+- **Impact:** There is one registry location per the plan and three in practice, and no contract test loads frozen schemas from any of them. Delta's contract lives under its own pod (`cybreach_pod_delta/contracts/`), so the "shared repo" is three independent copies.
+- **Resolution:** One registry path at the workspace root; every pod publishes and every contract test loads from it.
+- **Status:** PARTIAL. Files are published somewhere; nothing is shared and nothing consumes them.
 
-### M6. Mutual-exclusion dependency pins
+### M6. Mutual-exclusion dependency pins, and Gamma's root manifest has regressed
 
 - **Violates:** plan Section 8 (FastAPI 0.115+, Python 3.12 single env); plan Section 7 contract-test seam requires one testable environment.
-- **Where:** `fastapi==0.115.6` (beta) vs `==0.141.1` (gamma) vs `==0.139.0` (delta) vs unpinned (alpha); `pydantic 2.10.3 / 2.13.4`; `uvicorn 0.32.1 / 0.52.2 / 0.49.0`; `pytest 8.3.4 / 9.1.1`.
-- **Impact:** No single requirement set satisfies all pods; a shared CI/dev env is impossible.
-- **Resolution:** Reconcile to one pinned set from plan Section 8 (FastAPI >=0.115.x line).
-- **Status (2026-09-24):** STILL PRESENT. ~~Gamma manifests were self-inconsistent (`httpx2` in root + `ocsf_normalizer`); they are now reconciled to one pinned set across root/`ocsf_normalizer`/`revalidation_service` (`fastapi==0.141.1, pydantic==2.13.4, uvicorn==0.52.2, pytest==9.1.1, httpx>=0.27.0`)~~ (Gamma internally consistent). Cross-pod divergence REMAINS: Delta still `fastapi==0.139.0` plus anomalous pins (`starlette==1.3.1`); Beta `0.115.6`; Alpha unpinned. No `contracts/requirements.lock` exists.
-
-### M7. Delta backend cannot boot in a fresh checkout
-
-- **Violates:** plan code-review checklist "No hardcoded secrets / error handling"; plan local-dev setup.
-- **Where:** `cybreach_pod_delta/backend/app/database/database.py:10-18` calls `create_engine(os.getenv("DATABASE_URL"))`; no `.env` committed anywhere -> `create_engine(None)` raises at import. `cybreach_pod_delta/backend/requirements.txt` omits runtime deps used by the code: `kafka` (`app/kafka/producer.py:2`), `slowapi` (`app/main.py:18-20`), `jose` (`app/security/security.py:3`), alembic (`alembic.ini`) -> `ImportError` after `pip install`.
-- **Impact:** Delta service is not runnable -> integration blocked on Delta side regardless of others.
-- **Resolution:** Commit a `.env.example`, fail fast with clear message, and declare all runtime deps.
-- **Status (2026-09-24):** STILL PRESENT. No `.env.example` in repo; `requirements.txt` still omits kafka/slowapi/jose/alembic; `backend/Dockerfile` is 0 bytes (empty) so Delta cannot be containerized either.
-
-### M8. Credit / wallet logic from plan Section 9 unimplemented
-
-- **Violates:** plan Section 9 "Credit Logic" (re-validation debits 1 credit, refund on inconclusive, mock wallet client); plan Week 9.
-- **Where:** No reference to `credit`, `wallet`, or `debit` in any pod (`grep` across all Python files returns nothing).
-- **Impact:** Re-validation cost accounting (a contract with Module 4) is entirely absent.
-- **Resolution:** Add mock wallet client (default 100 credits) in Gamma's Re-Validation Service; debit/refund hooks per plan Section 9.
-- **Status (2026-09-24):** ~~PARTIAL. Gamma added `revalidation_service/src/wallet.py` (`WalletClient(initial_balance=100)` with `debit()`/`refund()`) - but it is **never imported/used**; `revalidate()` in `revalidation_service/src/main.py:65-83` performs no debit and has no refund path. No other pod has wallet code.~~ **PATCHED (2026-09-24):** wallet is wired into `revalidate()` - debits 1 credit per run (HTTP 402 when the balance is exhausted), refunds 1 on `UNCHANGED`, and `GET /api/v2/revalidate/wallet` returns the balance (`revalidation_service/src/main.py:72-105`).
+- **Where:** Beta `cybreach_pod_beta/requirements.txt:1-4` pins `fastapi==0.115.6`, `pydantic==2.10.3`, `uvicorn[standard]==0.32.1`, `pytest==8.3.4` (and `kafka-python==3.0.11` at `:18`). Gamma's two service manifests agree with each other - `ocsf_normalizer/requirements.txt:1-5` and `revalidation_service/requirements.txt:1-5` both pin `fastapi==0.141.1, pydantic==2.13.4, uvicorn==0.52.2, pytest==9.1.1, httpx >= 0.27.0` - but Gamma's **root** `cybreach_pod_gamma/requirements.txt:1-9` is a different, unpinned set (`fastapi>=0.100.0`, `pydantic>=2.0.0`, `uvicorn>=0.22.0`, `pytest>=7.0.0`, `httpx>=0.24.0`, plus `aiokafka`, `redis`, `asyncpg`, and no `alembic` or `sqlalchemy` anywhere). A previous revision of this file recorded Gamma as internally consistent; that regressed - the reconcile commit set the root to the pinned set and two later commits restored the loose file. Delta `cybreach_pod_delta/backend/requirements.txt:6,17,18` still pins `fastapi==0.139.0`, `starlette==1.3.1`, `typing-inspection==0.4.2`. Alpha `cybreach_pod_alpha/rule ingestion/requirements.txt` is entirely unpinned (its only constraint is a `cryptography>=46.0.0` floor).
+- **Impact:** No single requirements set satisfies all pods; a shared CI/dev environment is impossible, and Gamma no longer installs the same versions its own CI runs.
+- **Resolution:** One pinned set from plan Section 8 across all four pods, with a committed lockfile the contract-test seam can install.
+- **Status:** STILL PRESENT. Beta and Gamma's service pins still differ from each other, Delta's differ from both, Alpha is unpinned, and Gamma's root manifest contradicts its own services.
 
 ### M9. Internal gRPC plumbing absent
 
 - **Violates:** plan Section 5 data flow steps (2),(5),(6),(7) (gRPC between services).
-- **Where:** All inter-service channels are REST or mock HTTP; no `.proto` files or gRPC servers found in any pod.
-- **Impact:** The plan's internal transport contract is unbuilt; integration will fall back to unagreed REST.
-- **Resolution:** Either implement gRPC per plan or explicitly re-scope internal calls to REST with a written contract (documented drift).
-- **Status (2026-09-24):** STILL PRESENT. Zero `.proto` files and zero `grpc`/`grpcio` references in any pod.
+- **Where:** A recursive search for `.proto` files and for `grpc`/`grpcio`/`protobuf` references across all four pods returns zero matches. Every inter-service channel is REST: Alpha <-> Beta is HTTP (`ve_app/main.py:46-73`), and the plan's internal transport contract is unbuilt.
+- **Impact:** Integration will proceed on unagreed REST, with the REST drift documented only implicitly by the code.
+- **Resolution:** Either implement gRPC per plan, or re-scope internal calls to REST with a written contract recorded as documented drift.
+- **Status:** STILL PRESENT.
 
 ### M10. Duplicate rule-dependency tracker inside Alpha
 
 - **Violates:** plan Week 7 single "rule dependency tracker".
-- **Where:** `VALIDATOR/rule ingestion/app/services/rule_dependency_tracker.py` (in-process) vs `VALIDATOR/rule ingestion/Rule_Dependency_Tracker/app/main.py` (a **separate FastAPI app** with its own `/rules`, `/dependencies`, own DB). Two implementations, different APIs.
-- **Impact:** Two dependency stores diverge; ambiguous which is canonical.
-- **Resolution:** Keep one (recommend the in-process service + endpoint) and delete the duplicate app.
-- **Status (2026-09-24):** STILL PRESENT. Both implementations still coexist (`app/services/rule_dependency_tracker.py` + `Rule_Dependency_Tracker/app/main.py` with own `/rules`,`/dependencies` + DB).
+- **Where:** `cybreach_pod_alpha/rule ingestion/app/services/rule_dependency_tracker.py` (127 lines, in-process dict at `:43`, with JSON backing only if a `storage_path` is passed - and `rules.py:25` constructs it without one) coexists with `cybreach_pod_alpha/rule ingestion/Rule_Dependency_Tracker/app/main.py` (a separate FastAPI app at `:10` with its own DB via `Depends(get_db)` at `:23` and `Base.metadata.create_all()` at `:8`). Only the first is imported (`rules.py:16-19`); the standalone service is orphaned, and its `requirements.txt` is the only fully pinned manifest in Alpha, so it advertises a version set nothing else uses.
+- **Impact:** Two dependency stores, different APIs, both in-process and neither durable; ambiguous which is canonical.
+- **Resolution:** Keep the in-process service plus its endpoint, delete the orphan app, and give the keeper real persistence.
+- **Status:** STILL PRESENT.
 
-### M11. Causal-chain type mismatch
+### M11. Causal-chain type mismatch at Beta's `/classify` boundary
 
-- **Violates:** plan Verdict Event v2.0 `causal_chain`; plan causal-chain reproducibility guarantee.
-- **Where:** Beta `cybreach-module2-pod-beta/services/outcome_classifier/oc_app/models.py:19` `causal_chain: List[CausalStep]` (objects) vs Alpha schema `causal_chain: array of string` (`VALIDATOR/contracts/verdict schema/verdict_schema.json:41-47`); Beta's own cross-pod test manually flattens objects to strings (`cybreach-module2-pod-beta/services/verdict_publisher/tests/test_cross_pod_pipeline.py:72-77`).
-- **Impact:** Fragile hand-rolled bridging that will break under real nested reasoning.
-- **Resolution:** Define `causal_chain` shape once (recommend structured steps + serialization contract).
-- **Status (2026-09-24):** STILL PRESENT. `oc_app/models.py:19` still `List[CausalStep]`; Alpha schema still `array of string`; the fragile bridge in `test_cross_pod_pipeline.py:72-77` is unchanged.
-
-### M12. Verdict integrity hash duplicated with different names/coverage
-
-- **Violates:** plan Section 9 `content_hash` (SHA-256); plan immutability guarantee.
-- **Where:** Beta `integrity_hash` (`ve_app/models.py:43`, covers action_id/verdict/confidence/...); Delta `verdict_hash` (`cybreach_pod_delta/backend/app/models/verdict.py:27`, covers rule_id/rule_name/verdict/event_data); plan says `content_hash`. Verification endpoints disagree.
-- **Impact:** Tamper-evidence schemes are incompatible; a consumer cannot verify a producer's hash.
-- **Resolution:** One canonical `content_hash` field (SHA-256 hex, 64 chars) computed over the full plan v2.0 verdict payload.
-- **Status (2026-09-24):** STILL PRESENT. Beta still `integrity_hash` (`ve_app/models.py:43`, `vp_app/models.py:15`, `verdict_integrity.py:45`); Delta still `verdict_hash` (`verdict.py:27`); `content_hash` appears nowhere in any pod.
+- **Violates:** plan Verdict Event v2.0 `causal_chain`; the causal-chain reproducibility guarantee.
+- **Where:** Alpha's contract types it `array of string` (`cybreach_pod_alpha/contracts/verdict schema/verdict_schema.json:41-47`) and Delta now emits real `List[str]` reasoning steps through the shared serializer (`cybreach_pod_delta/backend/app/contracts/verdict_event.py:154`, populated at `services/validator_service.py:165-170,186-192,203-210,222-226`). **Beta still declares objects**: `cybreach_pod_beta/services/outcome_classifier/oc_app/models.py:39` is `causal_chain: List[CausalStep]`, and `oc_app/main.py:79` passes the raw object list into `OutcomeVerdict`. The string projection that would fix it exists and is tested - `causal_chain_strings` at `oc_app/models.py:43-47` and `CausalStep.as_contract_entry` at `:14-26`, exercised by `oc_app/tests/test_contract_conformance.py:82,97` - but is not applied at the boundary, so the wire shape is still objects.
+- **Impact:** A consumer of `/classify` receives a different `causal_chain` type from the one the frozen contract and the other two pods use; the fix is present and simply not switched on.
+- **Resolution:** Return `causal_chain_strings` from `/classify` (or change the model), and validate the result against the frozen schema in a test.
+- **Status:** PARTIAL. Delta conforms and the projection exists in Beta; the response still carries objects.
 
 ---
 
@@ -245,169 +185,116 @@
 ### m1. Health-check response shapes differ
 
 - **Violates:** plan Section 7 local-dev "verify health via /health"; plan Section 5 connector health aggregation.
-- **Where:** `{"status":"ok"}` (beta, delta) vs `{"status":"healthy"}` (alpha, gamma revalidation) vs `{"status":"ok","service":...}` (beta services).
-- **Resolution:** Normalize to `{"status": "ok"}` + optional `service` field.
-- **Status (2026-09-24):** PARTIAL. ~~Beta patched internally: all three Beta services now return the uniform `{"status":"ok","service":...}` (`ve_app/main.py:205`, `oc_app/main.py:83`, `vp_app/main.py:64-66`)~~. ~~Gamma patched internally: normalizer + revalidation now return `{"status":"ok","service":...}` via `/health` (`ocsf_normalizer/src/main.py:82-85`, `revalidation_service/src/main.py:67-69`); the old `{"status":"healthy"}`/`{"status":"online"}` shapes were deleted with the duplicate subtree~~. Cross-pod still divergent: Alpha `{"status":"healthy"}` (`app/main.py:102`).
+- **Where:** Beta returns `{"status":"ok","service":...}` from all three services (`ve_app/main.py:247-249`, `oc_app/main.py:85-87`, `vp_app/main.py:167-174`); Gamma returns the same from both (`ocsf_normalizer/src/main.py:82-87`, `revalidation_service/src/main.py:67-69`); Delta returns `{"status":"ok"}`. **Alpha is the last holdout**: `cybreach_pod_alpha/rule ingestion/app/main.py:102` returns a hardcoded `{"status": "healthy"}` and, despite the docstring at `:101`, evaluates no dependency, plugin or database health at all.
+- **Resolution:** Alpha returns `{"status": "ok", "service": "rule-ingestion"}` and actually probes its dependencies.
+- **Status:** PARTIAL. One pod and one static response remain.
 
-### m2. Duplicate `connectors` table + no-op migrations in Delta
+### m3. Beta repo drift: `Week1`-`Week11` snapshots, and an evidence_events migration that under-delivers its contract
 
-- **Violates:** plan Section 8 DB schema single `connectors` table.
-- **Where:** Delta alembic `cbf3cdf06b8f_add_connectors_table.py` and `dc17eb937333_add_connectors_table.py` are duplicate empty revisions; Gamma `cybreach_pod_gamma/ocsf_normalizer/migration/002_webhook_connector.sql:7` also creates `connectors` (different schema). Safe today (separate DBs) but a landmine if merged into one Postgres.
-- **Resolution:** Deduplicate migrations; decide a single `connectors` DDL owner for merged DB.
-- **Status (2026-09-24):** STILL PRESENT. Both empty pass-through revisions still present and chained (`cbf3cdf06b8f` -> `dc17eb937333` -> `cde517e5b5d6` -> `fa0be04e9958`); no DDL added. Gamma `002_webhook_connector.sql` unchanged.
+- **Violates:** plan Section 11 file structure (`services/` canonical); plan Section 9 frozen EvidenceEvent contract.
+- **Where:** `cybreach_pod_beta/Week1` through `Week11` all still exist at the top level and duplicate `services/` content (`Week2/migrations` duplicates `migrations/`); `pytest.ini:3-10` scopes collection to the three `services/*/tests` directories, so the snapshots are inert but still tracked. The single migration `cybreach_pod_beta/migrations/versions/0001_create_validation_runs_and_evidence_events.py:21-28` creates `evidence_events` with only `event_id, action_id, correlation_key, technique_ref, timestamp, created_at` - **omitting `target_asset_ref` and `expected_observable`**, which the Pydantic model requires (`services/validation_engine/ve_app/models.py:25-26`) and the frozen schema declares. `validation_runs` (`:32-41`) likewise has no `regulatory_control_refs` and no `content_hash` column, and no follow-up revision exists.
+- **Impact:** The migration claims to create the frozen contract's tables and does not; the snapshots bloat the repo and CI surface.
+- **Resolution:** Delete the week snapshots; extend `0001` to the full frozen column set.
+- **Status:** STILL PRESENT.
 
-### m3. Beta repo drift: Week1-Week11 snapshots
-
-- **Violates:** plan Section 11 file structure (`services/` canonical).
-- **Where:** `cybreach-module2-pod-beta/Week1/...` through `Week11/` duplicate `services/` content (`Week2/migrations` duplicates `migrations/`); `evidence_events` table (`cybreach-module2-pod-beta/migrations/versions/0001_create_validation_runs_and_evidence_events.py`) omits `target_asset_ref` and `expected_observable` from the frozen contract it claims to consume.
-- **Resolution:** Delete week snapshots; fix evidence_events columns to match the frozen schema.
-- **Status (2026-09-24):** STILL PRESENT. `Week1`-`Week11` dirs all still at top level; migration `0001_...:21-28` still omits `target_asset_ref`/`expected_observable` (model + frozen contract require them).
-
-### m4. Gamma Docker/CI artifacts disabled
+### m4. Gamma Docker/CI residue
 
 - **Violates:** plan Week 1 CI/CD + Docker configuration.
-- **Where:** `cybreach_pod_gamma/Dockerfile.txt`, `.dockerignore.txt`, `.github/workflows/ci.yml.txt` (renamed `.txt`) - no buildable images or CI.
-- **Resolution:** Restore extensions and wire a working pipeline.
-- **Status (2026-09-24):** ~~PARTIAL. Root `Dockerfile`, `.dockerignore`, `.github/workflows/ci.yml`, and `schema_engine/` equivalents restored (tracked); `ocsf_normalizer/` + `revalidation_service/` still `.txt`/empty stubs (`Dockerfile.txt`, `.dockerignore.txt`, `.github/workflows/ci.yml.txt` all 0 bytes)~~ **PATCHED (2026-09-24):** per-service `Dockerfile`s (normalizer EXPOSE + uvicorn 8005; revalidation 8006) and non-empty `.dockerignore`s added; all `.txt` stubs deleted; root copies + `schema_engine/` subtree removed (see N-G1).
+- **Where:** Gamma's substantive gaps are closed - real per-service `Dockerfile`s (`ocsf_normalizer/Dockerfile:12,14` on 8005, `revalidation_service/Dockerfile:10,12` on 8006), non-empty per-service `.dockerignore`s (`ocsf_normalizer/.dockerignore:1-9`, `revalidation_service/.dockerignore:1-9`), and a working `.github/workflows/ci.yml:34` that runs `python run_tests.py` across both suites (4452 tests pass). Three residues remain: `cybreach_pod_gamma/.dockerignore` is tracked and **0 bytes**, so a root-context build would still copy `.git` and `node_modules`; `cybreach_pod_gamma/ocsf_normalizer/.gitignore.txt` is still tracked with real rules under a `.txt` suffix (the sibling file was deleted from `revalidation_service`, this one was missed); and Gamma's root `docker-compose.yml` is tracked again - it was deleted as a duplicate, then re-added in `743d94e` - although what it now contains is a legitimate 39-line infra compose rather than a pod duplicate.
+- **Resolution:** Delete the 0-byte root `.dockerignore` and the stray `.gitignore.txt`.
+- **Status:** PARTIAL.
 
-### m5. Gamma test/requirement inconsistency
+### m5. Gamma `httpx` pin is inconsistent between its root and service manifests
 
-- **Where:** Gamma tests use `fastapi.testclient.TestClient` (needs `httpx`), but root `requirements.txt` pins `httpx2==2.10.0` (nonstandard pkg name); `revalidation_service/requirements.txt` lists both `httpx2` and `httpx`. README's root `pytest` flow will likely fail.
-- **Resolution:** Pin the real `httpx` package consistently across gamma manifests.
-- **Status (2026-09-24):** ~~PARTIAL. `revalidation_service/requirements.txt` fixed to only `httpx>=0.27.0`; root `requirements.txt:5` + `ocsf_normalizer/requirements.txt:5` still `httpx2 == 2.10.0`, so root CI would fail~~ **PATCHED (2026-09-24):** all three manifests pin `httpx >= 0.27.0` (root, `ocsf_normalizer`, `revalidation_service`); CI also runs the `revalidation_service` suite (see N-G4).
+- **Where:** The nonstandard `httpx2` package is gone from the workspace, which was the actual blocker, and CI passes. But `cybreach_pod_gamma/requirements.txt:7` pins `httpx>=0.24.0` while `ocsf_normalizer/requirements.txt:5` and `revalidation_service/requirements.txt:5` both pin `httpx >= 0.27.0`. Root `pytest.ini:21` is `testpaths = ocsf_normalizer/tests`, so it runs the normalizer suite only, and `README.md:182-183` claims it targets both.
+- **Resolution:** Pin the same `httpx` version in all three manifests and correct the README's description of `pytest.ini`.
+- **Status:** PARTIAL.
 
 ### m6. Connector vendor enum casing inconsistency
 
-- **Where:** `VALIDATOR/contracts/connector specification/connector_specification.json` has lowercase `"crowdstrike"` amid capitalized vendor values; delta connector docs use "Microsoft Sentinel"/"QRadar".
-- **Resolution:** Normalize vendor identifiers (lowercase kebab) in the connector spec.
-- **Status (2026-09-24):** STILL PRESENT - and WORSE. Spec still `"crowdstrike"` lowercase amid capitalized values (`connector_specification.json:15-24`); runtime registration keys diverge again (`crowdstrike_logscale_connector.py:388` -> `crowdstrike_logscale`, `sentinel_connector.py:226` -> `sentinel`, `qradar_connector.py:415` -> `qradar`).
+- **Where:** `cybreach_pod_alpha/contracts/connector specification/connector_specification.json:17-23` declares `["Splunk","Microsoft Sentinel","IBM QRadar","Elastic","crowdstrike"]` - capitalized display names, with `crowdstrike` lowercase - while every runtime registration key is a lowercase slug: `crowdstrike_logscale_connector.py:387-390` -> `crowdstrike_logscale`, `sentinel_connector.py:226` -> `sentinel`, `qradar_connector.py:414-417` -> `qradar`, `splunk_connector.py:447-450` -> `splunk`, `elastic_connector.py:339-342` -> `elastic`. `config_validation.py:12-18` keys on that same slug set. **No runtime key matches any contract enum value verbatim**, and the repo contradicts itself: `tests/test_connector_contract.py:49` passes `vendor="crowdstrike"`, which `config_validation.py:65` rejects.
+- **Impact:** A contract-validated connector can never match a real registry key, and the repo's own test suite asserts a value the validator forbids.
+- **Resolution:** Pick one identifier form (lowercase slug), use it in the spec, the registry, the validator and the tests, and treat display names as labels only.
+- **Status:** STILL PRESENT.
 
-### m7. Credentials/secrets hygiene
+### m7. Secrets hygiene: plaintext credentials in git history and in Beta's compose
 
 - **Violates:** plan review checklist "No hardcoded secrets".
-- **Where:** Hardcoded `admin/admin123` (`cybreach_pod_delta/backend/app/api/auth.py:14-15`, `docs/API_REFERENCE.md`); plaintext Postgres password `validator_dev_pw` (`cybreach-module2-pod-beta/docker-compose.yml:10`); `cybreach_pod_gamma/connectors.db` (SQLite) committed.
-- **Resolution:** Env/vault for all secrets; gitignore runtime artifacts.
-- **Status (2026-09-24):** ~~Alpha side clean~~ (Alpha added `app/connector/credential_manager.py` - env-driven Fernet encryption, no hardcoded secrets, `alembic.ini` leaves DB URL blank). ~~Gamma side fixed: `connectors.db` untracked and removed from the repo (2026-09-24)~~. REMAINS: Delta `admin/admin123` + hardcoded `SECRET_KEY` (`security.py:9`) + committed DB creds `postgres:vyom` (`backend/alembic.ini:89`); Beta `POSTGRES_PASSWORD: validator_dev_pw` (`docker-compose.yml:10`).
+- **Where:** Alpha, Delta and Gamma are clean in the working tree - Alpha uses env-driven Fernet with no fallback (`app/connector/credential_manager.py:10-25`) and a blank `alembic.ini:21`; Delta reads `ADMIN_USERNAME`/`ADMIN_PASSWORD`/`SECRET_KEY` from the environment only (`app/api/auth.py:21-22`, `app/security/security.py:18,27-36`), carries no credential in `alembic.ini:96`, and no longer prints received tokens; Gamma's `connectors.db` is untracked. **Still open:** `cybreach_pod_beta/docker-compose.yml:10` hardcodes `POSTGRES_PASSWORD: validator_dev_pw` (with `POSTGRES_USER: validator` at `:9`, referenced by the healthcheck at `:17`), and both the old (`postgres:vyom`) and the newer (`validator_dev_pw`) Delta credentials remain in **git history** - rotating a secret does not remove it. Two smaller Alpha instances: a test-only literal at `tests/test_alembic_migrations.py:26` and a hardcoded `sqlite:///./rules.db` in the orphaned `Rule_Dependency_Tracker/app/database.py:4`.
+- **Resolution:** Move Beta's DB password to an env var with no default; rewrite git history (or rotate and document the exposure) for the two Delta credentials.
+- **Status:** PARTIAL.
 
-### m8. SSRF-adjacent ingest by design
+### m8. SSRF-adjacent ingest and unhandled malformed input
 
-- **Where:** `VALIDATOR/rule ingestion/app/api/rules.py` `clone_repo` clones arbitrary user-supplied URLs without allow-listing; also `cybreach_pod_delta/backend/app/api/validator.py:23-27` does `json.loads(rule_query)` with no error handling (500 on malformed input).
-- **Resolution:** URL allow-list / domain policy; validate + 422 on bad input.
-- **Status (2026-09-24):** STILL PRESENT. Alpha `clone_repo` (`rules.py:107-136`) still clones any `http(s)` URL or local path with no allow-list; Delta `validator_service.py:10-12` still runs `json.loads(rule_query)` without try/except (duplicate call, produces HTTP 500 not 422).
+- **Violates:** plan code-review checklist "error handling" (validate and reject bad input).
+- **Where:** Alpha's `clone_repo` (`cybreach_pod_alpha/rule ingestion/app/api/rules.py:107-136`) clones any user-supplied target with **zero validation** - the only check anywhere is a Pydantic field validator at `app/models/rule_models.py:75-80` that accepts any `http(s)` host or any local path. There is no allow-list, no private-IP or loopback guard. Separately, Delta raises `MalformedRuleQuery` at `backend/app/services/validator_service.py:144,149` but **nothing catches it**: `app/api/validator.py:29-32` calls `validate_rule(...)` bare, with no `try`/`except` and no `HTTPException` imported, so a malformed `rule_query` still produces an HTTP 500. The docstring at `validator_service.py:36` states "The API layer turns this into a 422"; that layer does not exist. A previous revision of this file recorded the 422 as done - it is not, and re-verification against the source confirms it.
+- **Resolution:** Add a URL allow-list / domain policy to `clone_repo`; catch `MalformedRuleQuery` at the API boundary and return 422.
+- **Status:** STILL PRESENT.
 
 ---
 
-## Section 4 - Per-Pod Conflict Status (Post-Audit, 2026-09-24)
+## Section 4 - Per-Pod Open Conflicts
 
-Re-audit of each repository at its current HEAD. `PATCHED` = resolved; `PARTIAL` = partially addressed; `STILL PRESENT` = untouched. Newly discovered integration risks are listed per pod as `N-A#`/`N-B#`/`N-G#`/`N-D#`.
+Counts reflect this file's contents only. Anything not listed for a pod is either resolved or owned by another pod.
 
-| Pod | Directory | B1-B13 | M1-M12 | m1-m8 | New conflicts |
+| Pod | Directory | Blockers | Major | Minor | New conflicts |
 | --- | --- | --- | --- | --- | --- |
-| Alpha | `VALIDATOR/` | 12 STILL PRESENT (B3/B4/B9 = Delta-only) | 11 STILL PRESENT + 1 PARTIAL (B8) | 5 STILL PRESENT, 2 PATCHED | 5 (N-A1..N-A5) |
-| Beta | `cybreach-module2-pod-beta/` | 13 STILL PRESENT | 11 STILL PRESENT + 1 PARTIAL (M1) | 6 STILL PRESENT, 1 PARTIAL (m1) | 4 (N-B1..N-B4) |
-| Gamma | `cybreach_pod_gamma/` | B11 STILL PRESENT | M8 PATCHED; M1/M3/M5 PARTIAL (Gamma side fixed, cross-pod open) | m4/m5 PATCHED; m1/m7 PARTIAL (Gamma side fixed, cross-pod open) | N-G1..N-G8 PATCHED |
-| Delta | `cybreach_pod_delta/` | 13 STILL PRESENT | 12 STILL PRESENT | 8 STILL PRESENT | 8 (N-D1..N-D8) |
+| Alpha | `cybreach_pod_alpha/` | B1, B2, B6, B8, B11 | M1, M3, M4, M6, M9, M10 | m1, m6, m7, m8 | N-A1, N-A2, N-A4, N-A5 |
+| Beta | `cybreach_pod_beta/` | B1, B6, B7, B8, B11, B12, B13 | M4, M5, M6, M9, M11 | m3, m7 | N-B2, N-B4 |
+| Gamma | `cybreach_pod_gamma/` | B1, B10, B11 | M3, M5, M6, M9 | m4, m5 | N-G3, N-G10 |
+| Delta | `cybreach_pod_delta/` | B1, B6, B7, B11 | M2, M3, M5, M6, M9 | m7, m8 | N-D18, N-D19 |
 
-### Pod Alpha - `VALIDATOR/`
+### Pod Alpha - `cybreach_pod_alpha/`
 
-**Patched / resolved:**
+- **N-A1 (MAJOR):** Vendor identifier triple-divergence - contract enum, runtime registry keys and the validator share no value; see **m6**. A contract-validated connector would not match a real registry key.
+- **N-A2 (MINOR):** Dead model set. `rule ingestion/app/services/rule_models.py` (60 lines) defines `ParsedRule`/`RuleIngestRequest`/`SyntaxValidationReport` that nothing imports - every importer uses `app/models/rule_models.py`. Its shapes differ from the live models (`rule_id: Optional[str]=None` at `:26` against the live required `str`). `app/services/rule_pipeline.py` is dead on the same pattern: imported by nothing, and it passes `rule_id=None` at `:46,102`, which the live model's required `str` would reject - direct evidence it has never been executed.
+- **N-A4 (MINOR):** `/health` is a static `{"status": "healthy"}` that probes nothing; see **m1**.
+- **N-A5 (BLOCKER):** `rule_id` is assigned `parsed_dict.get("rule_id") or "UNKNOWN"` (`app/api/rules.py:180`) rather than the plan's content-hash canonical id, with the hash written to a separate field at `:184`; see **B6**. `clone_repo` remains an unguarded SSRF surface (`app/api/rules.py:107-136`); see **m8**.
 
-- ~~m7 (Alpha side): no hardcoded secrets; connector credentials encrypted with env-driven Fernet key~~ (`app/connector/credential_manager.py`); `alembic.ini` deliberately leaves DB URL blank.
-- ~~B8 (Alembic half): `alembic/versions/001_create_detection_rules.py` is now a real revision~~ with an offline migration test, though the running service still uses the in-memory store.
+### Pod Beta - `cybreach_pod_beta/`
 
-**Still present from `conflict.md`:** B1, B2, B5, B6, B7, B8 (store part), B10, B11, B12, B13; M1, M2, M4, M5, M6, M9, M10, M11, M12; m1, m6, m8. (B3, B4, B9, M3, M7, m2, m3, m4, m5, m7-others are owned by other pods.)
-
-**New conflicts (Alpha):**
-
-- **N-A1 (MAJOR):** Vendor identifier triple-divergence. Spec enum `connector_specification.json:15-24` (`Splunk`, `Microsoft Sentinel`, `IBM QRadar`, `Elastic`, `crowdstrike`) vs runtime registration keys (`crowdstrike_logscale_connector.py:388`, `sentinel_connector.py:226`, `qradar_connector.py:415`) vs `config_validation.py:17`. A contract-validated connector would not match real registry keys.
-- **N-A2 (MINOR):** Dead/duplicate model set `app/services/rule_models.py` (60 lines) defines `ParsedRule`/`RuleIngestRequest`/`SyntaxValidationReport` that nothing imports; `rule_id: Optional[str]` contradicts the canonical `app/models/rule_models.py`.
-- **N-A3 (BLOCKER):** Zero cross-pod wiring effective. No pod calls Alpha's `POST /api/v2/rules/ingest`, `GET /api/v2/rules`, or `/{rule_id}/dependencies`; no `GET /api/v2/rules` list route exists (only `/search`).
-- **N-A4 (MINOR):** Health shape still `{"status": "healthy"}` (`app/main.py:102`) instead of the normalized `{"status":"ok"}`.
-- **N-A5 (BLOCKER):** `rule_id` still assigned as `parsed_dict.get("rule_id") or "UNKNOWN"` (`rules.py:180`) - not the plan's content-hash canonical id; `clone_repo` (m8) remains an unguarded SSRF surface (`rules.py:107-136`).
-
-### Pod Beta - `cybreach-module2-pod-beta/`
-
-**Patched / resolved:**
-
-- ~~m1 (Beta side): all three services now return the uniform `{"status":"ok","service":...}`~~ (`ve_app/main.py:205`, `oc_app/main.py:83`, `vp_app/main.py:64-66`).
-
-**Still present from `conflict.md`:** B1, B2, B5, B6, B7, B8, B10, B11, B12, B13; M1 (port 8002/8000), M2, M4, M6, M9, M11, M12; m3, m6(NA), m7. No verdict schema exists in `contracts/` (only `evidence_event_schema.json` + `CONSUMED_CONTRACTS.md`).
-
-**New conflicts (Beta):**
-
-- **N-B1 (BLOCKER - regression):** `services/validation_engine/ve_app/main.py:150-155` has a Python syntax error - an orphaned `def validate_evidence(` with no body followed by a redefinition. `ast.parse` fails; `ve_app.main` cannot be imported, breaking `ingestion.py:24`, `incremental_validation.py:11`, `tests/test_cross_pod_pipeline.py:3`, and the `/validate` endpoint.
-- **N-B2 (MAJOR):** No deployable packaging. `docker-compose.yml` defines only infra (postgres/redis/kafka/kafka-ui); there are **zero** `Dockerfile`s in Beta and no app services defined.
-- **N-B3 (MINOR):** Outcome Classifier claims port `8003` (`oc_app/main.py:5`) - not in the port registry and now collides with Gamma's revalidation image (`cybreach_pod_gamma/Dockerfile:10-12`).
-- **N-B4 (MAJOR):** DB schema drift beyond the two evidence columns - `validation_runs` has no `regulatory_control_refs`/content-hash column, and `target_asset_ref`/`expected_observable` exist only in the Pydantic model + frozen JSON schema, not in the migration.
+- **N-B2 (MAJOR):** No deployable packaging. `docker-compose.yml` defines only infrastructure (postgres/redis/kafka/kafka-ui); there are **zero** `Dockerfile`s anywhere in Beta and no app services are defined.
+- **N-B4 (MAJOR):** DB schema drift beyond the two evidence columns - `migrations/versions/0001_create_validation_runs_and_evidence_events.py:32-41` gives `validation_runs` no `regulatory_control_refs` and no `content_hash`, and the two evidence columns the frozen contract requires are missing too; see **m3**. `detection_logic` is string-coerced at the Alpha seam; see **B8**.
 
 ### Pod Gamma - `cybreach_pod_gamma/`
 
-**Patched / resolved:**
-
-- ~~M2 (Gamma side): no `NoData`/`No Data` anywhere in source; revalidation verdict enum is `IMPROVED`/`DEGRADED`/`UNCHANGED`~~ (`revalidation_service/src/core/contracts.py:52`).
-- ~~M5 (Gamma side): `shared_registry/v1/windows_auth.json` now exists and is tracked; README + `publish_contract.py` now document `contracts/` as the publish target~~ (still unwired cross-pod - see below).
-- ~~M8: `revalidation_service/src/wallet.py` added with default 100 credits + debit/refund (still not invoked)~~ => **PATCHED:** wired into `revalidate()` - debits 1 credit, refunds on `UNCHANGED`, `GET /api/v2/revalidate/wallet` (`revalidation_service/src/main.py:72-105`).
-- ~~M1 (Gamma side): normalizer/revalidation no longer default to 8000/8003; bind 8005/8006 with frontend on 5174 -> 8005~~ (N-G5; cross-pod 8000/8002/5173 remain with other pods).
-- ~~M3 (Gamma side): duplicated class-registry routes and the whole `schema_engine/` subtree removed; single registry left in `ocsf_normalizer/src/main.py:124-224`~~ (Alpha + Delta registries unchanged).
-- ~~m4: root `Dockerfile`, `.dockerignore`, `.github/workflows/ci.yml` and `schema_engine/` equivalents restored~~ => **PATCHED:** per-service Dockerfiles (8005/8006) + non-empty `.dockerignore`; `.txt` stubs removed (N-G1 / N-G6).
-- ~~m5: `revalidation_service/requirements.txt` fixed to real `httpx`~~ => **PATCHED:** all manifests `httpx >= 0.27.0`; CI also runs revalidation suite (N-G4).
-- ~~m1 (Gamma side): normalizer + revalidation `/health` now return `{"status":"ok","service":...}`~~ (Alpha shape still divergent).
-- ~~m7 (Gamma side): `connectors.db` untracked and removed from the repo~~ (Delta + Beta secrets remain).
-
-**Still present / partially open from `conflict.md`:** B11 (all APIs unauth except webhook HMAC); M6 (cross-pod pin divergence - Gamma manifests now internally consistent), M9, M12; m1 (cross-pod - only Alpha's `{"status":"healthy"}` shape remains). (M1/M3/M5/m4/m5/m7 Gamma sides resolved - see Patched list above.)
-
-**New conflicts (Gamma):**
-
-- ~~**N-G1 (BLOCKER):** Nested `schema_engine/` is a full duplicate pod (141 tracked files mirroring root `app/`/`src/`/`ocsf_normalizer/`/`revalidation_service/`/`contracts/`/`shared_registry/`). Same routes exist 2-3x; any fix must land in both or they drift.~~ **PATCHED (2026-09-24):** entire `schema_engine/` subtree + root duplicate `app/`/`alembic/`/`Dockerfile`/`docker-compose.yml` deleted; `ocsf_normalizer/` + `revalidation_service/` are canonical. Also closes M3 Gamma half.
-- ~~**N-G2 (MAJOR):** `frontend/node_modules/` is committed (2,267 tracked files) - massively bloats repo/CI.~~ **PATCHED (2026-09-24):** untracked (git-ignored via `frontend/.gitignore`).
-- ~~**N-G3 (MINOR):** README drift - still claims `publish_contract.py` writes to `shared_registry/v1/` and documents a removed scheduler (script now writes `contracts/`).~~ **PATCHED (2026-09-24):** README aligned (ports 8005/8006/5174, `contracts/` publish path, scheduler refs dropped). Also resolves M5 README half.
-- ~~**N-G4 (BLOCKER):** CI cannot pass - root installs `httpx2==2.10.0` then `pytest` runs `ocsf_normalizer/tests` needing real `httpx`; test paths duplicated across copies.~~ **PATCHED (2026-09-24):** `httpx>=0.27.0` everywhere; CI also runs the revalidation suite. Also resolves m5.
-- ~~**N-G5 (MAJOR):** Port plan inconsistent - Dockerfile runs revalidation on `8003` only, frontend proxies to `8000` (`frontend/vite.config.js:10`), README uses default 8000.~~ **PATCHED (2026-09-24):** normalizer 8005 / revalidation 8006 / frontend 5174 -> 8005. Also resolves M1 Gamma half.
-- ~~**N-G6 (MINOR):** Empty `.dockerignore` files (0 B) at root and `schema_engine/` - image builds would copy `.git/` and `node_modules/`.~~ **PATCHED (2026-09-24):** root/schema_engine stubs deleted; per-service non-empty `.dockerignore` added (m4).
-- ~~**N-G7 (MINOR):** Odd artifacts: `app/__init__.py.py`, `app/models/__init__.py.py`, `alembic/versions/0001_create_custom_ocsf_classes_table.py.py`, `schema_engine/requirements.txt.txt` (0 B).~~ **PATCHED (2026-09-24):** all removed.
-- ~~**N-G8 (MINOR):** `.coverage` binaries committed at root and inside `schema_engine/`.~~ **PATCHED (2026-09-24):** untracked.
+- **N-G3 (MINOR):** README drift is reduced but not gone. Ports and the `contracts/` publish path are correct, but two scheduler references survive - `README.md:100` ("schedules automated re-validation passes") and `README.md:161` (`002_revalidation_schedules.sql`, still tracked) - and `README.md:182-183` misstates `pytest.ini`, which runs only the normalizer suite (`pytest.ini:21`).
+- **N-G10 (MINOR):** `POST /api/v2/webhook/connectors` is unauthenticated (`ocsf_normalizer/src/main.py:393-417`), so the HMAC guard on `ingest` is only as strong as an open registration endpoint; folded into **B11**.
 
 ### Pod Delta - `cybreach_pod_delta/`
 
-**Patched / resolved:** none. All 13 blockers, all 12 majors, and all 8 minors from `conflict.md` remain in the working tree (HEAD `c6e7d23`; only cosmetic commit `Fix PDF export layout` since the review).
-
-**New conflicts (Delta):**
-
-- **N-D1 (BLOCKER):** Kong topology broken end-to-end - upstream `host.docker.internal:8033` is bound by nothing (`kong.yml:5`); root compose maps Kong to host `8000` (collides with backend `8000`); `api-gateway/docker-compose.yml` maps host `8002`; frontend `api.ts:4` uses `127.0.0.1:8000`.
-- **N-D2 (BLOCKER):** Alembic chain inconsistent - `963dcd789856_add_verdict_hash.py:25` operates on table `"verdicts"` while model `__tablename__` is `"verdict_events"`; initial `0cb22bf6e0a0` never creates `verdict_events` cleanly.
-- **N-D3 (BLOCKER):** `backend/Dockerfile` is 0 bytes (empty) - backend cannot be containerized, compounding M7 boot + the 8033 gap.
-- **N-D4 (MINOR):** `compare_rule` route (`rules.py:250-251`) has no auth dependency while every other `/rules` handler does.
-- **N-D5 (MINOR):** Dead/duplicate code - unreachable duplicate 404 in `api/verdicts.py:62-68`; duplicate `json.loads` at `validator_service.py:10` and `:12`.
-- **N-D6 (BLOCKER):** `backend/app/kafka/consumer.py:20` runs `for message in consumer:` at module import time (infinite loop that would hang any worker that imports it).
-- **N-D7 (BLOCKER):** Committed DB credentials - `backend/alembic.ini:89` = `postgresql://postgres:vyom@localhost:5432/verdict_db`.
-- **N-D8 (MINOR):** Anomalous pins (`fastapi==0.139.0`, `starlette==1.3.1`, `typing-inspection==0.4.2`) that may not resolve cleanly, on top of the missing runtime deps in M7.
+- **N-D18 (BLOCKER):** `app/services/dashboard_service.py:27` joins `Verdict.rule_id == Rule.id` - a 64-character content hash against an integer surrogate - so `/dashboard/coverage` cannot join its own tables. This is the same class of defect that was fixed in `causal_chain_service.py:24` and missed here; folded into **B6**.
+- **N-D19 (MINOR):** `app/api/rules.py:265-270` still hardcodes `"Suspicious PowerShell"` as demo data in the compare endpoint's `proposed` block. Cosmetic, unlike the hardcode removed from the validate path, but it is the last such literal in Delta.
 
 ---
 
-## Reconciliation Owner Table (suggested)
+## Reconciliation Owner Table
 
-| Conflict | Suggested owner | Action |
+Open items only. Owner per plan Section 7 unless noted.
+
+| Conflict | Owner | Remaining action |
 | --- | --- | --- |
-| Verdict contract (B2, B3) | Delta (publisher) | Publish frozen v2.0 schema; all pods consume |
-| Rule_id type (B6) | Alpha | Content-hash `rule_id` string; Delta adopts |
-| Confidence scale (B5) | Delta + Beta | Normalize 0.0-1.0 in shared schema |
-| Kafka bus + topics (B1, B10) | Integration env (Delta) | Single KRaft stack, plan topic names |
-| gRPC rule delivery (B8) | Alpha + Beta | Shared contract + client |
-| Connector framework (B12, M3) | Alpha | Keeper of connectors + registry; others consume |
-| `/api/v2` surface + gateway (B13) | Delta + all | Standardize prefix; fix kong upstream/port |
-| Auth/JWT (B11) | Delta | Provide shared JWT middleware; all pods adopt |
-| Re-validation credits (M8) | Gamma | Wire the existing `WalletClient` into revalidate; add refund on inconclusive |
-| Dependency pins (M6) | Integration env | Single reconciled requirements set |
-| Ports (M1) | Integration env | Port registry; gateway internal ports |
+| Verdict contract (B2) | Delta (publisher) | Alpha adopts the frozen v2.0 field list; Beta adds a frozen-schema acceptance test (its digest test exists at `test_verdict_integrity.py:163-192`, but Beta has no `verdict.schema.json` and never runs `jsonschema.validate` on a verdict) |
+| Rule_id type (B6) | Alpha | Assign the content-hash canonical id; Delta fixes `dashboard_service.py:27` (N-D18) |
+| Message bus + topics (B1, B10) | Integration env (Delta) | One root infra compose; one shared topic manifest replacing the two hand-written copies; a real `cybreach.evidence.v1` consumer in Beta; repoint the runbooks that still document the deleted `verdict-publisher/` and `verdict-events` |
+| gRPC rule delivery (B8) | Alpha (Beta REST client partial) | Alpha persists `INGESTED_RULES`; Alpha binds the registry port 8001; Beta uses Alpha for batch and caller-supplied flows; stop `str()`-coercing `detection_logic` |
+| Connector framework (B12, M3) | Alpha | Keeper of connectors + registry; others consume. Decide who owns the `connectors` DDL in a merged DB (Gamma's `002_webhook_connector.sql:7` vs Delta's `platform_connector_health`) |
+| `/api/v2` surface (B13) | Delta + Beta | Flatten `validator_router` so `POST /api/v2/validate` exists; version all of Beta's routes |
+| Auth/JWT + tenant scoping (B11) | Delta + Alpha + Beta + Gamma | Shared JWT issuer adopted by Alpha/Beta/Gamma; authenticate Gamma's connector registration; add `tenant_id` and per-query filtering in every pod |
+| Contract registry (M5) | Integration env | One root `contracts/` path; every pod publishes there and every contract test loads from it |
+| Dependency pins (M6) | Integration env | One pinned set across all four pods; restore Gamma's root manifest and a committed lockfile |
+| Ports (M1) | Integration env | Reconcile Alpha's actual 8000 against the registry's 8001, in the Dockerfile, the README and Beta's client default |
+| Ownership dedupe (B7, M10) | Alpha + Beta | Retire Beta's `verdict_publisher/` and `ve_app/connectors.py`; delete Alpha's orphaned `Rule_Dependency_Tracker/app` |
 
-## Priority Actions (from 2026-09-24 audit)
+## Priority Actions
 
-1. **Fix Beta N-B1 first** - `ve_app/main.py:150-155` syntax error blocks import of the whole Validation Engine.
-2. **Stand up root `contracts/`** per plan Phase B - `verdict.v2.schema.json`, `evidence.v1.schema.json`, `topics.yaml`, `port-registry.md`; all pods consume root contracts, not pod-local copies.
-3. **Shared JWT + env secrets** (B11, m7) - remove `admin/admin123`, hardcoded `SECRET_KEY`, `postgres:vyom` DB creds, Beta plaintext password; untrack Gamma `connectors.db`.
-4. **Unify Kafka bus** (B1, B10, B9) - single KRaft stack + plan topic names; delete Delta's mis-shaped `evidence-events` consumers.
-5. **Canonicalize verdict shape** (B2, B3, B5, B6, M11, M12) - Delta owns frozen v2.0; adopt content-hash `rule_id`, 0.0-1.0 confidence, single `content_hash`, one `causal_chain` shape, one `NoData` spelling.
-6. **Ownership dedupe** (B7, B12, M3, M10, m2, m3, N-G1) - retire Beta duplicates, Alpha `Rule_Dependency_Tracker/app`, Gamma `schema_engine/` subtree (or pick canonical), Beta week snapshots, Delta no-op migrations.
-7. **Wire seams** (B8, M4, M9) - rule-delivery channel Alpha->Beta; dependency reporting; gRPC or documented REST drift.
-8. **Delta blocking fixes** - Kong topology (N-D1), Alembic `verdicts`/`verdict_events` (N-D2), empty Dockerfile (N-D3), consumer import loop (N-D6), env-based boot (M7), 422 on malformed input (m8).
-
+1. **Stand up the bus and close the evidence seam** (B1, B10) - a root `docker-compose.yml` with KRaft Kafka, PostgreSQL and Redis, one shared `topics.yaml` replacing Delta's and Gamma's independent copies, and a real `cybreach.evidence.v1` consumer in Beta's Validation Engine. Nothing downstream is demonstrable until an evidence event reaches a verdict.
+2. **Close B11's tenant-scoping half and Alpha/Beta/Gamma's authentication** - a schema migration plus per-query filtering in every pod, a shared JWT issuer, and an authenticated connector-registration route in Gamma. The Delta route guards are done; this is the part that is not, and it is a migration rather than a guard.
+3. **Persist Alpha's rule store and reconcile its port** (B8, M1, N-A5) - move `INGESTED_RULES` behind the `detection_rules` table Alpha already migrates, and settle 8000 vs 8001 across the Dockerfile, the README, the registry and Beta's client default. Until then the rule seam silently depends on Alpha never restarting.
+4. **Get Alpha onto the frozen verdict contract** (B2) - add `regulatory_control_refs` and `content_hash`, make all 8 fields required, and add a test that validates a Delta- or Beta-produced event.
+5. **Standardize the API surface** (B13) - flatten `POST /api/v2/validator/validate` to `POST /api/v2/validate` and put Beta's `/validate`, `/validate/batch`, `/classify` and `/publish` under `/api/v2`, so one gateway can front all four pods.
+6. **Switch Beta's `/classify` to the string causal chain** (M11) - the `causal_chain_strings` projection is written and tested; it is only not applied at `oc_app/main.py:79`. Then add the frozen-schema acceptance test that is missing from Beta.
+7. **Fix the remaining int-vs-hash join and the unhandled exception** (B6/N-D18, m8) - `dashboard_service.py:27`, and catch `MalformedRuleQuery` at `api/validator.py:29-32` so it returns 422 instead of 500.
+8. **Reconcile dependency pins and delete Beta's week snapshots** (M6, m3) - one pinned set across four pods, Gamma's root manifest restored, and `Week1`-`Week11` removed with `0001` extended to the full frozen column set.
+9. **Retire the duplicate implementations** (B7, B12, M10) - Beta's `verdict_publisher/` and `ve_app/connectors.py`, Alpha's orphaned `Rule_Dependency_Tracker/app` and its dead `services/rule_models.py` + `services/rule_pipeline.py`.
+10. **Secrets and history** (m7) - move Beta's `POSTGRES_PASSWORD` to an env var, and rewrite or formally rotate-and-document the two Delta credentials still present in git history.
