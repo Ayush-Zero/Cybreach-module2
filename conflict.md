@@ -1,10 +1,11 @@
 # CyBreach Module 2 - Cross-Pod Integration Conflicts
 
-- **Date:** 2026-09-29 (re-verified against the pod working trees)
+- **Date:** 2026-09-30 (re-verified against the pod working trees, after resolving Beta, Delta and Gamma)
 - **Scope:** Pod integration readiness review for Module 2 (The Validator)
 - **Plan source:** `CyBreach_Module2_TheValidator_TextOnly.pdf` (authoritative spec: services, contracts, API surface, topics, security, credits)
 - **Method:** Static compatibility review across all four pod repositories; each finding cites the files involved and the plan section it violates.
 - **Revision note (2026-09-29):** this file now lists **open work only**. Every conflict that was previously recorded as `PATCHED` was re-checked against the pod repositories and deleted here only where the code actually satisfies it. Four previously-`PATCHED` items did not survive re-verification and have been returned to the open list with the contradicting evidence: **B13** (`POST /api/v2/validate` does not exist - the route is still `/api/v2/validator/validate`), **m8** (the 422 conversion was never implemented; `MalformedRuleQuery` is raised and never caught), **M6** (Gamma's root manifest regressed to a loose pin set, and Delta's were never bumped to match), and Delta's "one payload for all transports" (true, but `dashboard_service.py:27` still joins a string hash against an integer - now **B6/N-D18**). Claims that verification could not substantiate were downgraded rather than removed.
+- **Revision note (2026-09-30):** **Beta, Delta and Gamma were resolved** and their fully-satisfied entries are deleted below: **M2**, **M11**, **m4**, **m5**, **N-G3**, **N-D18**, **N-D19**. Identifiers are unchanged, so the deleted numbers are now gaps. **Alpha was deliberately left untouched** and every Alpha-owned conflict below is still open - several of them (**B6**, **m6**, **m8**, **M6**, **B8**) were partly resolvable in the other three pods and those halves are now recorded as closed, so the remaining text is the Alpha-side remainder only. Three entries shrank rather than disappeared, because only part of each is fixable without Alpha: **B6** (Delta conforms, Alpha does not), **m7** (Beta is clean, Delta's credentials are still in git history) and **m8** (Delta now returns 422, Alpha's `clone_repo` is still unguarded). One undeclared regression was also fixed: commit `962c112` added a `DATABASE_URL` guard in Delta that raised `NameError` on every import and broke collection of all 52 of its tests.
 
 ## Pod -> Directory Mapping (from plan Section 7)
 
@@ -43,14 +44,14 @@
 - **Resolution:** Alpha adopts the frozen v2.0 field list and adds a conformance test that validates a Delta- or Beta-produced event against it.
 - **Status:** PARTIAL. Delta and Beta conform; Alpha does not.
 
-### B6. `rule_id` type and derivation still disagree, and one Delta join still mixes the two
+### B6. `rule_id` type and derivation still disagree - Alpha never adopted the canonical id
 
 - **Violates:** plan Section 8 tech-stack/db schema `detection_rules (rule_id, ...)`; the cross-pod traceability guarantee.
-- **Where:** Delta's verdict-side surface is now string-keyed on the canonical content hash: `Rule.rule_id` is `String(64) unique` (`cybreach_pod_delta/backend/app/models/rule.py:14`), `Verdict.rule_id` is `String(64)` with a foreign key onto it (`app/models/verdict.py:43`), the response type is `str` (`app/schemas/verdict.py:13`), and both dashboard services declare `rule_id: string` (`frontend-dashboard/src/services/verdictService.ts:10`, `revalidationDashboardService.ts:8`). `app/services/causal_chain_service.py:24` now joins `Rule.rule_id == verdict.rule_id` instead of comparing a hash to an int, so `/verdicts/{id}/chain` can match.
-- **Where (still open):** the same int-vs-hash bug **survives in a second place** - `app/services/dashboard_service.py:27` still joins `Verdict.rule_id == Rule.id`, i.e. a 64-char hash against an integer surrogate, so `/dashboard/coverage` cannot join. And Alpha never adopted the canonical id at all: `cybreach_pod_alpha/rule ingestion/app/api/rules.py:180` assigns `rule_id=parsed_dict.get("rule_id") or "UNKNOWN"`, with the content hash written to a *separate* field at `:184`. Alpha's model types `rule_id` as a free-form required `str` up to 255 chars (`app/models/rule_models.py:114-119`), so nothing forces it to be the digest Beta and Delta now key on. Delta's own `/rules/{rule_id}` routes still key on the integer surrogate `Rule.id`, which is correct - that is Delta's rule-management surface, not a cross-pod identity.
-- **Impact:** A rule produced by Alpha is keyed by a string Beta and Delta do not compute; `dashboard_service` additionally cannot join its own tables.
-- **Resolution:** Freeze `rule_id` as the content-hash string in the shared schema; fix `dashboard_service.py:27`; make Alpha assign the digest.
-- **Status:** PARTIAL. Delta's schema and dashboard types conform; one Delta join and all of Alpha do not.
+- **Where (closed in Delta):** Delta's verdict-side surface is string-keyed on the canonical content hash: `Rule.rule_id` is `String(64) unique` (`cybreach_pod_delta/backend/app/models/rule.py:14`), `Verdict.rule_id` is `String(64)` with a foreign key onto it (`app/models/verdict.py:43`), the response type is `str` (`app/schemas/verdict.py:13`), and both dashboard services declare `rule_id: string` (`frontend-dashboard/src/services/verdictService.ts:10`, `revalidationDashboardService.ts:8`). Both joins now agree: `app/services/causal_chain_service.py:24` and `app/services/dashboard_service.py:27` both join `Rule.rule_id == Verdict.rule_id`. `Rule.id` remains Delta's local surrogate key for its own `/rules` routes, which is correct - that is Delta's rule-management surface, not a cross-pod identity.
+- **Where (still open - all of it is Alpha):** Alpha never adopted the canonical id at all: `cybreach_pod_alpha/rule ingestion/app/api/rules.py:180` assigns `rule_id=parsed_dict.get("rule_id") or "UNKNOWN"`, with the content hash written to a *separate* field at `:184`. Alpha's model types `rule_id` as a free-form required `str` up to 255 chars (`app/models/rule_models.py:114-119`), so nothing forces it to be the digest Beta and Delta now key on. `rules.py:78` also leaves `INGESTED_RULES` keyed by whatever Alpha decided, so Beta's client is handed a string no other pod computes.
+- **Impact:** A rule produced by Alpha is keyed by a string Beta and Delta do not compute, so a rule ingested upstream cannot be traced to the verdict that Beta and Delta publish about it.
+- **Resolution:** Freeze `rule_id` as the content-hash string in the shared schema; make Alpha assign the digest.
+- **Status:** PARTIAL. Delta is fully conformant on both schema and joins; Alpha is untouched and remains the whole of the open remainder.
 
 ### B7. Service ownership conflict vs plan Section 7
 
@@ -114,14 +115,6 @@
 - **Resolution:** Move Alpha to 8001 in its Dockerfile, README and the Beta client default, or change the registry and every reference to match; then re-check the whole set together.
 - **Status:** PARTIAL. Beta, Delta and Gamma conform; Alpha's actual port contradicts the registry and collides with the canonical publisher.
 
-### M2. Verdict enum spelling: `NoData` vs `No Data`
-
-- **Violates:** plan ambiguity itself - the glossary says `NoData`, PRD 3.4 says `No Data`; it still has to be reconciled once.
-- **Where:** Beta emits canonical `NoData` (`services/validation_engine/ve_app/main.py:139`, `outcome_classifier/oc_app/main.py:54`) and normalizes legacy spellings at the publish edge (`verdict_publisher/vp_app/models.py:51-60,88-111`). Delta emits `NoData`/`Missed`/`Detected` and runs every payload through `normalize_verdict()` (`cybreach_pod_delta/backend/app/contracts/verdict_event.py:73-79`), so a row written under the old spelling still compares correctly. **Still open:** the legacy alias is retained by design in Delta's own source (`app/contracts/verdict_event.py:53`, plus comments at `:14,:36`) - that retention is correct, but the dashboard still offers the legacy token as a user-facing filter option (`frontend-dashboard/src/components/VerdictFilter.tsx:25`), and `docs/API_REFERENCE.md` still documents the old spelling. Gamma uses its own independent `IMPROVED`/`DEGRADED`/`UNCHANGED` enum (`revalidation_service/src/core/contracts.py:52`) and is not part of this conflict.
-- **Impact:** Users can still select and be shown `"No Data"` in the dashboard, and the published API reference still teaches the wrong token.
-- **Resolution:** Drop the legacy option from the dashboard filter and the old token from `API_REFERENCE.md`; keep the input-side alias in Delta's normalizer, which is a compatibility feature rather than a conflict.
-- **Status:** PARTIAL. Both publishers agree and Beta and Delta hash identical bytes; two user-facing surfaces still carry the old spelling.
-
 ### M3. Connector/registry APIs triplicated and incompatible
 
 - **Violates:** plan Section 5 `POST /api/v2/connectors/register`, `GET /api/v2/connectors/health`.
@@ -146,13 +139,14 @@
 - **Resolution:** One registry path at the workspace root; every pod publishes and every contract test loads from it.
 - **Status:** PARTIAL. Files are published somewhere; nothing is shared and nothing consumes them.
 
-### M6. Mutual-exclusion dependency pins, and Gamma's root manifest has regressed
+### M6. Mutual-exclusion dependency pins, and no single set is agreed across the pods
 
 - **Violates:** plan Section 8 (FastAPI 0.115+, Python 3.12 single env); plan Section 7 contract-test seam requires one testable environment.
-- **Where:** Beta `cybreach_pod_beta/requirements.txt:1-4` pins `fastapi==0.115.6`, `pydantic==2.10.3`, `uvicorn[standard]==0.32.1`, `pytest==8.3.4` (and `kafka-python==3.0.11` at `:18`). Gamma's two service manifests agree with each other - `ocsf_normalizer/requirements.txt:1-5` and `revalidation_service/requirements.txt:1-5` both pin `fastapi==0.141.1, pydantic==2.13.4, uvicorn==0.52.2, pytest==9.1.1, httpx >= 0.27.0` - but Gamma's **root** `cybreach_pod_gamma/requirements.txt:1-9` is a different, unpinned set (`fastapi>=0.100.0`, `pydantic>=2.0.0`, `uvicorn>=0.22.0`, `pytest>=7.0.0`, `httpx>=0.24.0`, plus `aiokafka`, `redis`, `asyncpg`, and no `alembic` or `sqlalchemy` anywhere). A previous revision of this file recorded Gamma as internally consistent; that regressed - the reconcile commit set the root to the pinned set and two later commits restored the loose file. Delta `cybreach_pod_delta/backend/requirements.txt:6,17,18` still pins `fastapi==0.139.0`, `starlette==1.3.1`, `typing-inspection==0.4.2`. Alpha `cybreach_pod_alpha/rule ingestion/requirements.txt` is entirely unpinned (its only constraint is a `cryptography>=46.0.0` floor).
-- **Impact:** No single requirements set satisfies all pods; a shared CI/dev environment is impossible, and Gamma no longer installs the same versions its own CI runs.
+- **Where (Gamma is now internally consistent):** all three of Gamma's manifests - `cybreach_pod_gamma/requirements.txt`, `ocsf_normalizer/requirements.txt:1-5` and `revalidation_service/requirements.txt:1-5` - now carry the same pinned set (`fastapi==0.141.1, pydantic==2.13.4, uvicorn==0.52.2, pytest==9.1.1, httpx>=0.27.0`) byte-for-byte, so `pip install -r requirements.txt` at the pod root finally produces the environment its own CI runs. The root manifest's previous loose pins, and its four unused dependencies (`aiokafka`, `redis`, `asyncpg`, `pytest-asyncio`, none of which is imported anywhere in the pod), are gone.
+- **Where (still open):** Gamma is the only pod that agrees with itself. Beta pins `fastapi==0.115.6, pydantic==2.10.3, uvicorn[standard]==0.32.1, pytest==8.3.4` and `kafka-python==3.0.11` at `:18`. Delta pins `fastapi==0.139.0, starlette==1.3.1, typing-inspection==0.4.2` (`cybreach_pod_delta/backend/requirements.txt:6,17,18`) - still not bumped to match Gamma. Alpha's `rule ingestion/requirements.txt` is entirely unpinned, its only constraint being a `cryptography>=46.0.0` floor.
+- **Impact:** No single requirements set satisfies the pods that can be edited, and Alpha's unpinned manifest is still the widest gap; a shared CI/dev environment remains impossible.
 - **Resolution:** One pinned set from plan Section 8 across all four pods, with a committed lockfile the contract-test seam can install.
-- **Status:** STILL PRESENT. Beta and Gamma's service pins still differ from each other, Delta's differ from both, Alpha is unpinned, and Gamma's root manifest contradicts its own services.
+- **Status:** PARTIAL. Gamma reconciles internally; the cross-pod set is unagreed, and closing it needs Alpha.
 
 ### M9. Internal gRPC plumbing absent
 
@@ -169,14 +163,6 @@
 - **Impact:** Two dependency stores, different APIs, both in-process and neither durable; ambiguous which is canonical.
 - **Resolution:** Keep the in-process service plus its endpoint, delete the orphan app, and give the keeper real persistence.
 - **Status:** STILL PRESENT.
-
-### M11. Causal-chain type mismatch at Beta's `/classify` boundary
-
-- **Violates:** plan Verdict Event v2.0 `causal_chain`; the causal-chain reproducibility guarantee.
-- **Where:** Alpha's contract types it `array of string` (`cybreach_pod_alpha/contracts/verdict schema/verdict_schema.json:41-47`) and Delta now emits real `List[str]` reasoning steps through the shared serializer (`cybreach_pod_delta/backend/app/contracts/verdict_event.py:154`, populated at `services/validator_service.py:165-170,186-192,203-210,222-226`). **Beta still declares objects**: `cybreach_pod_beta/services/outcome_classifier/oc_app/models.py:39` is `causal_chain: List[CausalStep]`, and `oc_app/main.py:79` passes the raw object list into `OutcomeVerdict`. The string projection that would fix it exists and is tested - `causal_chain_strings` at `oc_app/models.py:43-47` and `CausalStep.as_contract_entry` at `:14-26`, exercised by `oc_app/tests/test_contract_conformance.py:82,97` - but is not applied at the boundary, so the wire shape is still objects.
-- **Impact:** A consumer of `/classify` receives a different `causal_chain` type from the one the frozen contract and the other two pods use; the fix is present and simply not switched on.
-- **Resolution:** Return `causal_chain_strings` from `/classify` (or change the model), and validate the result against the frozen schema in a test.
-- **Status:** PARTIAL. Delta conforms and the projection exists in Beta; the response still carries objects.
 
 ---
 
@@ -197,19 +183,6 @@
 - **Resolution:** Delete the week snapshots; extend `0001` to the full frozen column set.
 - **Status:** STILL PRESENT.
 
-### m4. Gamma Docker/CI residue
-
-- **Violates:** plan Week 1 CI/CD + Docker configuration.
-- **Where:** Gamma's substantive gaps are closed - real per-service `Dockerfile`s (`ocsf_normalizer/Dockerfile:12,14` on 8005, `revalidation_service/Dockerfile:10,12` on 8006), non-empty per-service `.dockerignore`s (`ocsf_normalizer/.dockerignore:1-9`, `revalidation_service/.dockerignore:1-9`), and a working `.github/workflows/ci.yml:34` that runs `python run_tests.py` across both suites (4452 tests pass). Three residues remain: `cybreach_pod_gamma/.dockerignore` is tracked and **0 bytes**, so a root-context build would still copy `.git` and `node_modules`; `cybreach_pod_gamma/ocsf_normalizer/.gitignore.txt` is still tracked with real rules under a `.txt` suffix (the sibling file was deleted from `revalidation_service`, this one was missed); and Gamma's root `docker-compose.yml` is tracked again - it was deleted as a duplicate, then re-added in `743d94e` - although what it now contains is a legitimate 39-line infra compose rather than a pod duplicate.
-- **Resolution:** Delete the 0-byte root `.dockerignore` and the stray `.gitignore.txt`.
-- **Status:** PARTIAL.
-
-### m5. Gamma `httpx` pin is inconsistent between its root and service manifests
-
-- **Where:** The nonstandard `httpx2` package is gone from the workspace, which was the actual blocker, and CI passes. But `cybreach_pod_gamma/requirements.txt:7` pins `httpx>=0.24.0` while `ocsf_normalizer/requirements.txt:5` and `revalidation_service/requirements.txt:5` both pin `httpx >= 0.27.0`. Root `pytest.ini:21` is `testpaths = ocsf_normalizer/tests`, so it runs the normalizer suite only, and `README.md:182-183` claims it targets both.
-- **Resolution:** Pin the same `httpx` version in all three manifests and correct the README's description of `pytest.ini`.
-- **Status:** PARTIAL.
-
 ### m6. Connector vendor enum casing inconsistency
 
 - **Where:** `cybreach_pod_alpha/contracts/connector specification/connector_specification.json:17-23` declares `["Splunk","Microsoft Sentinel","IBM QRadar","Elastic","crowdstrike"]` - capitalized display names, with `crowdstrike` lowercase - while every runtime registration key is a lowercase slug: `crowdstrike_logscale_connector.py:387-390` -> `crowdstrike_logscale`, `sentinel_connector.py:226` -> `sentinel`, `qradar_connector.py:414-417` -> `qradar`, `splunk_connector.py:447-450` -> `splunk`, `elastic_connector.py:339-342` -> `elastic`. `config_validation.py:12-18` keys on that same slug set. **No runtime key matches any contract enum value verbatim**, and the repo contradicts itself: `tests/test_connector_contract.py:49` passes `vendor="crowdstrike"`, which `config_validation.py:65` rejects.
@@ -217,19 +190,21 @@
 - **Resolution:** Pick one identifier form (lowercase slug), use it in the spec, the registry, the validator and the tests, and treat display names as labels only.
 - **Status:** STILL PRESENT.
 
-### m7. Secrets hygiene: plaintext credentials in git history and in Beta's compose
+### m7. Secrets hygiene: Delta's old credentials are still in git history
 
 - **Violates:** plan review checklist "No hardcoded secrets".
-- **Where:** Alpha, Delta and Gamma are clean in the working tree - Alpha uses env-driven Fernet with no fallback (`app/connector/credential_manager.py:10-25`) and a blank `alembic.ini:21`; Delta reads `ADMIN_USERNAME`/`ADMIN_PASSWORD`/`SECRET_KEY` from the environment only (`app/api/auth.py:21-22`, `app/security/security.py:18,27-36`), carries no credential in `alembic.ini:96`, and no longer prints received tokens; Gamma's `connectors.db` is untracked. **Still open:** `cybreach_pod_beta/docker-compose.yml:10` hardcodes `POSTGRES_PASSWORD: validator_dev_pw` (with `POSTGRES_USER: validator` at `:9`, referenced by the healthcheck at `:17`), and both the old (`postgres:vyom`) and the newer (`validator_dev_pw`) Delta credentials remain in **git history** - rotating a secret does not remove it. Two smaller Alpha instances: a test-only literal at `tests/test_alembic_migrations.py:26` and a hardcoded `sqlite:///./rules.db` in the orphaned `Rule_Dependency_Tracker/app/database.py:4`.
-- **Resolution:** Move Beta's DB password to an env var with no default; rewrite git history (or rotate and document the exposure) for the two Delta credentials.
-- **Status:** PARTIAL.
+- **Where (closed in the working tree):** Alpha, Delta and Gamma carry no credential in any tracked file - Alpha uses env-driven Fernet with no fallback (`app/connector/credential_manager.py:10-25`) and a blank `alembic.ini:21`; Delta reads `ADMIN_USERNAME`/`ADMIN_PASSWORD`/`SECRET_KEY` from the environment only (`app/api/auth.py:21-22`, `app/security/security.py:18,27-36`) and carries none in `alembic.ini:96`; Gamma's `connectors.db` is untracked. Beta's compose no longer hardcodes one either - `docker-compose.yml` now takes `POSTGRES_USER`/`POSTGRES_PASSWORD` from the environment with no default and aborts if either is unset, and `.env` is gitignored with `.env.example` as the tracked template. Two smaller Alpha instances also remain: a test-only literal at `tests/test_alembic_migrations.py:26` and a hardcoded `sqlite:///./rules.db` in the orphaned `Rule_Dependency_Tracker/app/database.py:4`.
+- **Where (still open):** both the old (`postgres:vyom`) and the newer (`validator_dev_pw`) Delta credentials remain in **git history**. Removing the literal from the current file does not remove it from any clone, and rotating a secret does not un-expose the old one.
+- **Resolution:** Rewrite git history for the two Delta credentials, or rotate them and record the exposure with its date and scope.
+- **Status:** PARTIAL. Every working tree is clean; the Delta history rewrite is not done and is not a code fix.
 
-### m8. SSRF-adjacent ingest and unhandled malformed input
+### m8. Alpha's `clone_repo` is still an unguarded SSRF surface
 
 - **Violates:** plan code-review checklist "error handling" (validate and reject bad input).
-- **Where:** Alpha's `clone_repo` (`cybreach_pod_alpha/rule ingestion/app/api/rules.py:107-136`) clones any user-supplied target with **zero validation** - the only check anywhere is a Pydantic field validator at `app/models/rule_models.py:75-80` that accepts any `http(s)` host or any local path. There is no allow-list, no private-IP or loopback guard. Separately, Delta raises `MalformedRuleQuery` at `backend/app/services/validator_service.py:144,149` but **nothing catches it**: `app/api/validator.py:29-32` calls `validate_rule(...)` bare, with no `try`/`except` and no `HTTPException` imported, so a malformed `rule_query` still produces an HTTP 500. The docstring at `validator_service.py:36` states "The API layer turns this into a 422"; that layer does not exist. A previous revision of this file recorded the 422 as done - it is not, and re-verification against the source confirms it.
-- **Resolution:** Add a URL allow-list / domain policy to `clone_repo`; catch `MalformedRuleQuery` at the API boundary and return 422.
-- **Status:** STILL PRESENT.
+- **Where (closed in Delta):** Delta's half is done. `MalformedRuleQuery` is caught at the API boundary and returned as **422** (`cybreach_pod_delta/backend/app/api/validator.py:29-38`), which is what the service docstring at `app/services/validator_service.py:36` had always claimed that layer did; a malformed `rule_query` no longer escapes as an unhandled `ValueError` and a 500.
+- **Where (still open - all of it is Alpha):** `clone_repo` (`cybreach_pod_alpha/rule ingestion/app/api/rules.py:107-136`) clones any user-supplied target with **zero validation** - the only check anywhere is a Pydantic field validator at `app/models/rule_models.py:75-80` that accepts any `http(s)` host or any local path. There is no allow-list, no private-IP or loopback guard, so a caller can name `169.254.169.254` or `file:///etc/passwd` and the pod will fetch it on their behalf.
+- **Resolution:** Add a URL allow-list / domain policy to `clone_repo`, rejecting loopback, link-local and private ranges.
+- **Status:** PARTIAL. Delta is clean; Alpha's clone path is unguarded and Alpha was left untouched.
 
 ---
 
@@ -240,9 +215,9 @@ Counts reflect this file's contents only. Anything not listed for a pod is eithe
 | Pod | Directory | Blockers | Major | Minor | New conflicts |
 | --- | --- | --- | --- | --- | --- |
 | Alpha | `cybreach_pod_alpha/` | B1, B2, B6, B8, B11 | M1, M3, M4, M6, M9, M10 | m1, m6, m7, m8 | N-A1, N-A2, N-A4, N-A5 |
-| Beta | `cybreach_pod_beta/` | B1, B6, B7, B8, B11, B12, B13 | M4, M5, M6, M9, M11 | m3, m7 | N-B2, N-B4 |
-| Gamma | `cybreach_pod_gamma/` | B1, B10, B11 | M3, M5, M6, M9 | m4, m5 | N-G3, N-G10 |
-| Delta | `cybreach_pod_delta/` | B1, B6, B7, B11 | M2, M3, M5, M6, M9 | m7, m8 | N-D18, N-D19 |
+| Beta | `cybreach_pod_beta/` | B1, B6, B7, B8, B11, B12, B13 | M4, M5, M6, M9 | m3, m7 | N-B2, N-B4 |
+| Gamma | `cybreach_pod_gamma/` | B1, B10, B11 | M3, M5, M6, M9 | - | N-G10 |
+| Delta | `cybreach_pod_delta/` | B1, B6, B7, B11 | M3, M5, M6, M9 | m7, m8 | - |
 
 ### Pod Alpha - `cybreach_pod_alpha/`
 
@@ -258,13 +233,11 @@ Counts reflect this file's contents only. Anything not listed for a pod is eithe
 
 ### Pod Gamma - `cybreach_pod_gamma/`
 
-- **N-G3 (MINOR):** README drift is reduced but not gone. Ports and the `contracts/` publish path are correct, but two scheduler references survive - `README.md:100` ("schedules automated re-validation passes") and `README.md:161` (`002_revalidation_schedules.sql`, still tracked) - and `README.md:182-183` misstates `pytest.ini`, which runs only the normalizer suite (`pytest.ini:21`).
 - **N-G10 (MINOR):** `POST /api/v2/webhook/connectors` is unauthenticated (`ocsf_normalizer/src/main.py:393-417`), so the HMAC guard on `ingest` is only as strong as an open registration endpoint; folded into **B11**.
 
 ### Pod Delta - `cybreach_pod_delta/`
 
-- **N-D18 (BLOCKER):** `app/services/dashboard_service.py:27` joins `Verdict.rule_id == Rule.id` - a 64-character content hash against an integer surrogate - so `/dashboard/coverage` cannot join its own tables. This is the same class of defect that was fixed in `causal_chain_service.py:24` and missed here; folded into **B6**.
-- **N-D19 (MINOR):** `app/api/rules.py:265-270` still hardcodes `"Suspicious PowerShell"` as demo data in the compare endpoint's `proposed` block. Cosmetic, unlike the hardcode removed from the validate path, but it is the last such literal in Delta.
+- Delta has no new conflicts of its own. Its previous **N-D18** and **N-D19** are resolved and removed; what remains open for Delta is the shared ownership, bus, registry and security work listed against it above.
 
 ---
 
@@ -275,14 +248,14 @@ Open items only. Owner per plan Section 7 unless noted.
 | Conflict | Owner | Remaining action |
 | --- | --- | --- |
 | Verdict contract (B2) | Delta (publisher) | Alpha adopts the frozen v2.0 field list; Beta adds a frozen-schema acceptance test (its digest test exists at `test_verdict_integrity.py:163-192`, but Beta has no `verdict.schema.json` and never runs `jsonschema.validate` on a verdict) |
-| Rule_id type (B6) | Alpha | Assign the content-hash canonical id; Delta fixes `dashboard_service.py:27` (N-D18) |
+| Rule_id type (B6) | Alpha | Assign the content-hash canonical id. Delta's schema and both of its joins conform; the whole open remainder is Alpha's |
 | Message bus + topics (B1, B10) | Integration env (Delta) | One root infra compose; one shared topic manifest replacing the two hand-written copies; a real `cybreach.evidence.v1` consumer in Beta; repoint the runbooks that still document the deleted `verdict-publisher/` and `verdict-events` |
 | gRPC rule delivery (B8) | Alpha (Beta REST client partial) | Alpha persists `INGESTED_RULES`; Alpha binds the registry port 8001; Beta uses Alpha for batch and caller-supplied flows; stop `str()`-coercing `detection_logic` |
 | Connector framework (B12, M3) | Alpha | Keeper of connectors + registry; others consume. Decide who owns the `connectors` DDL in a merged DB (Gamma's `002_webhook_connector.sql:7` vs Delta's `platform_connector_health`) |
 | `/api/v2` surface (B13) | Delta + Beta | Flatten `validator_router` so `POST /api/v2/validate` exists; version all of Beta's routes |
 | Auth/JWT + tenant scoping (B11) | Delta + Alpha + Beta + Gamma | Shared JWT issuer adopted by Alpha/Beta/Gamma; authenticate Gamma's connector registration; add `tenant_id` and per-query filtering in every pod |
 | Contract registry (M5) | Integration env | One root `contracts/` path; every pod publishes there and every contract test loads from it |
-| Dependency pins (M6) | Integration env | One pinned set across all four pods; restore Gamma's root manifest and a committed lockfile |
+| Dependency pins (M6) | Integration env | One pinned set across all four pods, plus a committed lockfile. Gamma is internally consistent; Beta, Delta and the unpinned Alpha still differ |
 | Ports (M1) | Integration env | Reconcile Alpha's actual 8000 against the registry's 8001, in the Dockerfile, the README and Beta's client default |
 | Ownership dedupe (B7, M10) | Alpha + Beta | Retire Beta's `verdict_publisher/` and `ve_app/connectors.py`; delete Alpha's orphaned `Rule_Dependency_Tracker/app` |
 
@@ -293,8 +266,8 @@ Open items only. Owner per plan Section 7 unless noted.
 3. **Persist Alpha's rule store and reconcile its port** (B8, M1, N-A5) - move `INGESTED_RULES` behind the `detection_rules` table Alpha already migrates, and settle 8000 vs 8001 across the Dockerfile, the README, the registry and Beta's client default. Until then the rule seam silently depends on Alpha never restarting.
 4. **Get Alpha onto the frozen verdict contract** (B2) - add `regulatory_control_refs` and `content_hash`, make all 8 fields required, and add a test that validates a Delta- or Beta-produced event.
 5. **Standardize the API surface** (B13) - flatten `POST /api/v2/validator/validate` to `POST /api/v2/validate` and put Beta's `/validate`, `/validate/batch`, `/classify` and `/publish` under `/api/v2`, so one gateway can front all four pods.
-6. **Switch Beta's `/classify` to the string causal chain** (M11) - the `causal_chain_strings` projection is written and tested; it is only not applied at `oc_app/main.py:79`. Then add the frozen-schema acceptance test that is missing from Beta.
-7. **Fix the remaining int-vs-hash join and the unhandled exception** (B6/N-D18, m8) - `dashboard_service.py:27`, and catch `MalformedRuleQuery` at `api/validator.py:29-32` so it returns 422 instead of 500.
-8. **Reconcile dependency pins and delete Beta's week snapshots** (M6, m3) - one pinned set across four pods, Gamma's root manifest restored, and `Week1`-`Week11` removed with `0001` extended to the full frozen column set.
+6. ~~Switch Beta's `/classify` to the string causal chain (M11)~~ - **done**, removed above.
+7. ~~Fix the remaining int-vs-hash join and the unhandled exception (B6/N-D18, m8)~~ - **done in Delta**, removed above; the two Alpha-side remainders survive under **B6** and **m8**.
+8. **Reconcile dependency pins and delete Beta's week snapshots** (M6, m3) - one pinned set across four pods, and `Week1`-`Week11` removed with `0001` extended to the full frozen column set. Gamma's root manifest is already reconciled; the remaining pin gap is Beta, Delta and the unpinned Alpha.
 9. **Retire the duplicate implementations** (B7, B12, M10) - Beta's `verdict_publisher/` and `ve_app/connectors.py`, Alpha's orphaned `Rule_Dependency_Tracker/app` and its dead `services/rule_models.py` + `services/rule_pipeline.py`.
-10. **Secrets and history** (m7) - move Beta's `POSTGRES_PASSWORD` to an env var, and rewrite or formally rotate-and-document the two Delta credentials still present in git history.
+10. **Secrets and history** (m7) - Beta's `POSTGRES_PASSWORD` is now an env var and every working tree is clean; what is left is rewriting, or formally rotating and documenting, the two Delta credentials still present in git history.
