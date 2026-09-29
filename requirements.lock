@@ -1,0 +1,19 @@
+# CyBreach Module 2 - shared contract-test environment lock
+#
+# M6: the plan requires one testable environment across the pods so the
+# contract-test seam can install a single agreed set. This file pins the
+# subset the cross-pod contract tests and the pod test suites need, all
+# resolved from Gamma's now-internally-consistent manifest. The pods' full
+# runtime manifests remain the authority for their own services; this is the
+# floor the shared contract tests run against.
+#
+# Pods pin the same core (fastapi/pydantic/uvicorn/pytest/httpx); the remaining
+# pod-specific runtime deps (kafka-python, sqlalchemy, alembic, psycopg2,
+# redis) live in each pod's requirements.txt.
+
+fastapi==0.141.1
+pydantic==2.13.4
+uvicorn==0.52.2
+pytest==9.1.1
+httpx==0.28.1
+jsonschema==4.26.0

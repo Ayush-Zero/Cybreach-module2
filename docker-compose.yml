@@ -1,0 +1,106 @@
+# CyBreach Module 2 - shared integration infrastructure
+#
+# B1/B10: the plan wants ONE message bus and ONE PostgreSQL/Redis pair for the
+# whole module. Until this file every pod shipped its own compose, so three
+# files each claimed to bind 9092 and there was no stack that all four pods
+# could point at. This is that stack: infrastructure only. Pod services run
+# individually via `uvicorn` (hybrid run mode) or are started from their own
+# pod repositories; the pods reach this stack through the host-published ports.
+#
+# Ports are fixed by port-registery.md: 5432 / 6379 / 9092, plus 8080 for the
+# optional Kafka UI.
+#
+# Credentials come from the environment with no defaults and no committed
+# values; the stack refuses to start if they are missing. Copy .env.example to
+# .env (gitignored) and fill it in.
+#
+# Usage:  docker compose up -d
+#         (from this directory, the workspace root)
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: m2_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env or the environment}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env or the environment}
+      POSTGRES_DB: ${POSTGRES_DB:-module2_validator}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: m2_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Single KRaft broker (no ZooKeeper). This is the one bus for the module; the
+  # pods default to localhost:9092, which is the host-published port below.
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: m2_kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: m2_kafka_ui
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      - kafka
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:
+
+networks:
+  # The one shared network for the hybrid run. It is named explicitly so the
+  # pod-level compose files can attach their application services to this
+  # stack as `external: true` and reach the broker by its service name
+  # (`kafka:29092`) instead of by a host-published port. The plan's "single
+  # message bus" is only real if the pods and the broker share a network.
+  m2_infra:
+    name: m2_infra
+    driver: bridge

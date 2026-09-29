@@ -1,0 +1,50 @@
+# CyBreach Module 2 - Shared Message Bus Topic Manifest
+#
+# Plan Section 5 "Message Bus Topics". This is the single, authoritative list
+# of topic names for the whole module. Before this file each pod carried its
+# own hand-written copy of these five names and the copies were kept in sync
+# only by discipline (see conflict.md B1).
+#
+# Ownership per plan Section 7. The `usage` column records which direction the
+# owning pod drives the topic in the first hybrid run.
+#
+# Consumers resolve these names from here:
+#   - Delta  : backend/app/kafka/config.py           (M2_TOPICS_PATH)
+#   - Gamma  : revalidation_service/src/core/config.py
+#   - Beta   : services/*/  (KAFKA_TOPIC_* env, defaulting to these values)
+#
+# tests/test_cross_pod_contract.py asserts that every pod's resolved names are
+# exactly this list, so a pod can no longer drift from the manifest silently.
+
+version: 1
+
+topics:
+  - name: cybreach.evidence.v1
+    owner: beta
+    usage: consume
+    description: >-
+      Evidence events published by Module 1 (The Strike Engine). Consumed by
+      Beta's Validation Engine, which turns each event into a verdict.
+
+  - name: cybreach.verdicts.v2
+    owner: delta
+    usage: publish
+    description: >-
+      Canonical v2.0 verdict events. Delta is the publisher of record; Beta's
+      Verdict Publisher publishes the same eight-field payload.
+
+  - name: cybreach.gap_closed.v2
+    owner: delta
+    usage: publish
+    description: Emitted when a previously detected gap is closed.
+
+  - name: cybreach.revalidation.v1
+    owner: gamma
+    usage: publish
+    description: >-
+      Re-validation requests and results for Gamma's Re-Validation Service.
+
+  - name: cybreach.connector.health.v1
+    owner: gamma
+    usage: publish
+    description: Connector health heartbeats for cross-pod aggregation.
