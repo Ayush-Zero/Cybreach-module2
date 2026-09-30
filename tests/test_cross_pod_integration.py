@@ -35,6 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BETA_ROOT = REPO_ROOT / "cybreach_pod_beta"
 GAMMA_ROOT = REPO_ROOT / "cybreach_pod_gamma"
 DELTA_BACKEND = REPO_ROOT / "cybreach_pod_delta" / "backend"
+ALPHA_ROOT = REPO_ROOT / "cybreach_pod_alpha"
 
 TOPICS_MANIFEST = REPO_ROOT / "topics.yaml"
 CONTRACTS_DIR = REPO_ROOT / "contracts"
@@ -393,6 +394,23 @@ def test_delta_reads_the_registry_schema_not_a_private_copy():
     )
 
 
+def test_alpha_local_schema_matches_the_registry():
+    """M5/B2: the registry is the single owner. Alpha's pod-local verdict schema
+    must be byte-identical to it rather than a private pre-v2.0 drift."""
+
+    alpha_schema = ALPHA_ROOT / "contracts" / "verdict schema" / "verdict_schema.json"
+    assert alpha_schema.exists(), f"missing {alpha_schema}"
+
+    with open(VERDICT_SCHEMA, encoding="utf-8") as handle:
+        registry = json.load(handle)
+    with open(alpha_schema, encoding="utf-8") as handle:
+        alpha = json.load(handle)
+
+    assert alpha == registry, (
+        "Alpha's pod-local verdict schema drifted from the workspace registry"
+    )
+
+
 def test_delta_validates_a_real_payload_against_the_registry():
     """Delta's own serializer output must satisfy the shared schema."""
 
@@ -470,6 +488,7 @@ def test_pods_agree_on_the_core_dependency_set():
     gamma = _pins(GAMMA_ROOT / "requirements.txt")
     beta = _pins(BETA_ROOT / "requirements.txt")
     delta = _pins(DELTA_BACKEND / "requirements.txt")
+    alpha = _pins(ALPHA_ROOT / "rule ingestion" / "requirements.txt")
 
     for package in CORE_PACKAGES:
         versions = {
@@ -477,6 +496,7 @@ def test_pods_agree_on_the_core_dependency_set():
             "gamma": gamma.get(package),
             "beta": beta.get(package),
             "delta": delta.get(package),
+            "alpha": alpha.get(package),
         }
         present = {k: v for k, v in versions.items() if v}
         assert len(set(present.values())) == 1, (
