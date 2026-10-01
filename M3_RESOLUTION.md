@@ -8,7 +8,7 @@
 
 - `contracts/CONNECTOR_FRAMEWORK.md` — Documents the connector registry ownership model:
   - **Alpha** owns the canonical `connectors` table and `/api/v2/connectors/*` API
-  - **Gamma** owns only local `webhook_health` observability
+  - **Gamma** owns only local `webhook_connector_credentials` (its per-connector ingest secret + HMAC flag) and `webhook_health` observability
   - **Delta** owns only local `platform_connector_health` dashboard metadata
   - All pods must treat Alpha as the source of truth
 
@@ -34,12 +34,32 @@
 
 ### Pod Gamma (Ayush-Sonwane/cybreach_pod_gamma)
 
-**Commit:** Remove the duplicate canonical Gamma connector table so Alpha remains the only registry owner
+**Commit:** `4c41838` remove the duplicate canonical Gamma connector table so Alpha remains the only registry owner
 
 - `ocsf_normalizer/migration/002_webhook_connector.sql`
   - **Removed** the `CREATE TABLE connectors` statement that created a duplicate registry
-  - Kept only the local `webhook_health` table for local observability
-  - Added clear comments that this is local state only; the canonical registry is Alpha's
+  - Kept only local tables for observability; the canonical registry is Alpha's
+
+**Follow-up commit:** `26bae99` close the migration/code disagreement
+
+The commit above only edited the migration. `webhook/repository.py` still ran
+`CREATE TABLE IF NOT EXISTS connectors (...)` on open and `create_connector()`
+still wrote to it, so the running service recreated the very table the migration
+had stopped declaring - the stated architecture and the actual schema diverged,
+and a merged database could still collide. No test caught it, because each test
+builds its own schema on an isolated `tmp_path` SQLite file, so a green suite was
+not evidence either way.
+
+Gamma's local table is now **`webhook_connector_credentials`**, renamed rather
+than deleted, because `/api/v2/webhook/ingest` authenticates against a
+per-connector shared secret and HMAC flag that Alpha's registry does not model;
+"delete the table" would have broken ingest. Existing databases are migrated in
+place on open via `ALTER TABLE ... RENAME TO` (SQLite also propagates this into
+`webhook_health`'s foreign key), so connectors and their counters survive, the
+stale `idx_connectors_tenant` index is dropped, and the B11 `tenant_id` column is
+added. A fresh database never creates a table named `connectors` at all. Gated by
+`ocsf_normalizer/tests/test_m3_table_rename.py` (5 cases, built against a real
+pre-rename database).
 
 ---
 
