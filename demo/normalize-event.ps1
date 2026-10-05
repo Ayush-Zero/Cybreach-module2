@@ -11,6 +11,12 @@
 #
 # Reads the pod's own test fixtures, so it cannot drift from what the normalizer
 # actually supports.
+#
+# Usage:
+#   .\demo\normalize-event.ps1 -Vendor splunk            # summary line only
+#   .\demo\normalize-event.ps1 -Vendor splunk -Json      # full OCSF event body
+#   .\demo\normalize-event.ps1 -Vendor elastic -Json     # same endpoint, ECS input
+#   .\demo\normalize-event.ps1 -Count 0 -Json            # whole fixture at once
 
 param(
     [string]$GammaBase = 'http://127.0.0.1:8005',
@@ -21,7 +27,9 @@ param(
     [switch]$Follow,
     # How many fixture records to send. One is enough to demonstrate schema
     # detection; omit for all of them.
-    [int]$Count = 1
+    [int]$Count = 1,
+    # Print the full OCSF event body instead of the 4-field summary line.
+    [switch]$Json
 )
 
 $DemoDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -81,7 +89,11 @@ foreach ($record in $records) {
     }
 
     Write-Host "  in  : $($record.PSObject.Properties.Name -join ', ')" -ForegroundColor DarkGray
-    Write-Host "  out : class_uid=$($result.class_uid) activity=$($result.activity) severity=$($result.severity_id) user=$($result.actor.user.name)" -ForegroundColor Green
+    Write-Host "  out : class_uid=$($result.class_uid) activity_id=$($result.activity_id) severity=$($result.severity_id) user=$($result.actor.user.name)" -ForegroundColor Green
+
+    if ($Json) {
+        $result | ConvertTo-Json -Depth 15 | Write-Host
+    }
 }
 
 Write-Host ''
