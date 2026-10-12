@@ -15,8 +15,8 @@
 
 param(
     [string]$DeltaBase = 'http://127.0.0.1:8000',
-    [string]$Username = 'demo',
-    [string]$Password = 'demo123'
+    [string]$Username = $env:ADMIN_USERNAME,
+    [string]$Password = $env:ADMIN_PASSWORD
 )
 
 $DemoDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -145,5 +145,5 @@ if ($verdict.verdict -eq 'NoData') {
 }
 Write-Host 'Open the Delta dashboard:'
 Write-Host '  cd cybreach_pod_delta\frontend-dashboard'
-Write-Host '  npm run dev          # then http://127.0.0.1:5173  (demo / demo123)'
+Write-Host '  npm run dev          # then http://127.0.0.1:5173'
 Write-Host ''

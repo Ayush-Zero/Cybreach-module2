@@ -8,7 +8,8 @@
 # Alpha empties the store and the verdict degrades to NoData.
 
 param(
-    [string]$BearerToken = $env:B11_SERVICE_TOKEN
+    [string]$BearerToken = $env:B11_SERVICE_TOKEN,
+    [string]$RulesDir = $env:RULES_DIR
 )
 
 $DemoDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -16,10 +17,10 @@ $RepoRoot = Split-Path -Parent $DemoDir
 . (Join-Path $DemoDir 'demo-env.ps1') | Out-Null
 
 $Alpha = 'http://127.0.0.1:8001'
-$RulesDir = Join-Path $RepoRoot 'cybreach_pod_alpha\rule ingestion\tests\fixtures\rule_repo\sigma'
+$RulesDir = if ($RulesDir) { $RulesDir } else { $null }
 
-if (-not (Test-Path $RulesDir)) {
-    throw "Cannot find rules directory: $RulesDir"
+if (-not $RulesDir -or -not (Test-Path $RulesDir)) {
+    throw "Cannot find rules directory: $RulesDir. Provide -RulesDir or set RULES_DIR (must point to actual rules, not test fixtures)."
 }
 
 # Mint a token directly rather than using Delta's login.

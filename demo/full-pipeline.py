@@ -148,7 +148,16 @@ def mint_service_token():
     )
 
 
-def delta_login(username="demo", password="demo123"):
+def delta_login(username=None, password=None):
+    if username is None:
+        username = os.environ.get("ADMIN_USERNAME")
+    if password is None:
+        password = os.environ.get("ADMIN_PASSWORD")
+    if not username or not password:
+        raise RuntimeError(
+            "Delta credentials not set. Provide ADMIN_USERNAME and ADMIN_PASSWORD "
+            "via environment (.env or demo-env.ps1)."
+        )
     body = urllib.parse.urlencode({"username": username, "password": password})
     request = urllib.request.Request(
         f"{DELTA}/api/v2/auth/login",
@@ -482,7 +491,7 @@ def take_4_delta(args, state):
     say("Postgres, broadcasts on the WebSocket, and publishes to the same topic.")
 
     token = delta_login()
-    field("logged in", "demo / demo123 -> JWT (sub only, no tenant_id)")
+    field("logged in", "Delta auth OK (JWT issued)")
 
     run = run_id()
     rule_name = f"Pipeline Demo Encoded PowerShell {run}"

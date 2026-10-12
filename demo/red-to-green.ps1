@@ -23,8 +23,8 @@
 
 param(
     [string]$DeltaBase = 'http://127.0.0.1:8000',
-    [string]$Username = 'demo',
-    [string]$Password = 'demo123'
+    [string]$Username = $env:ADMIN_USERNAME,
+    [string]$Password = $env:ADMIN_PASSWORD
 )
 
 $DemoDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -162,6 +162,6 @@ Write-Host '    records REVALIDATED with old -> new.'
 Write-Host ''
 Write-Host 'Show it in the UI:' -ForegroundColor Cyan
 Write-Host '  cd cybreach_pod_delta\frontend-dashboard' -ForegroundColor Cyan
-Write-Host '  npm run dev            # http://127.0.0.1:5173  (demo / demo123)' -ForegroundColor Cyan
+Write-Host '  npm run dev            # http://127.0.0.1:5173' -ForegroundColor Cyan
 Write-Host '  the Re-validation view pairs the superseded verdict with its replacement' -ForegroundColor Cyan
 Write-Host ''

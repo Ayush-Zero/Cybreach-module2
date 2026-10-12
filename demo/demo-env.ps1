@@ -75,8 +75,12 @@ $env:DELTA_DATABASE_URL = "postgresql://$($env:POSTGRES_USER):$($env:POSTGRES_PA
 # m7 removed the hardcoded admin/admin123 fallback and deliberately left no
 # default, so Delta starts healthy but returns 401 on login until these are
 # set. That is the intended fail-closed behaviour.
-$env:ADMIN_USERNAME = 'demo'
-$env:ADMIN_PASSWORD = 'demo123'
+if (-not $env:ADMIN_USERNAME) {
+    throw "demo-env.ps1: ADMIN_USERNAME is not set. Set it in .env or your environment."
+}
+if (-not $env:ADMIN_PASSWORD) {
+    throw "demo-env.ps1: ADMIN_PASSWORD is not set. Set it in .env or your environment."
+}
 
 # --- Beta live-bus wiring -------------------------------------------------
 $env:KAFKA_EVIDENCE_ENABLED = 'true'
