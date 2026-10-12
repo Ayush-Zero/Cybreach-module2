@@ -9,14 +9,14 @@
 # not from a caller-supplied hint -- so the same call handles Splunk, Elastic,
 # Sentinel, QRadar or LogScale.
 #
-# Reads the pod's own test fixtures, so it cannot drift from what the normalizer
-# actually supports.
+# The vendor event is generated in memory per run (demo/gendata.py), so the demo
+# reads nothing committed to the repo and no two runs are identical.
 #
 # Usage:
 #   .\demo\normalize-event.ps1 -Vendor splunk            # summary line only
 #   .\demo\normalize-event.ps1 -Vendor splunk -Json      # full OCSF event body
 #   .\demo\normalize-event.ps1 -Vendor elastic -Json     # same endpoint, ECS input
-#   .\demo\normalize-event.ps1 -Count 0 -Json            # whole fixture at once
+#   .\demo\normalize-event.ps1 -Count 5 -Json            # several generated events at once
 
 param(
     [string]$GammaBase = 'http://127.0.0.1:8005',
@@ -25,40 +25,32 @@ param(
     [string]$Vendor = 'splunk',
     # Show the live log while normalizing instead of only afterwards.
     [switch]$Follow,
-    # How many fixture records to send. One is enough to demonstrate schema
-    # detection; omit for all of them.
+    # How many generated records to send. One is enough to demonstrate schema
+    # detection; pass more to fill the log.
     [int]$Count = 1,
     # Print the full OCSF event body instead of the 4-field summary line.
     [switch]$Json
 )
 
 $DemoDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RepoRoot = Split-Path -Parent $DemoDir
 . (Join-Path $DemoDir 'demo-env.ps1') | Out-Null
 
-$fixtureMap = @{
-    splunk   = 'splunk_events.json'
-    elastic  = 'ecs_events.json'
-    sentinel = 'sentinel_events.json'
-    qradar   = 'qradar_events.json'
-    logscale = 'logscale_events.json'
-}
+# Telemetry is generated at runtime; gendata.py knows the signature keys each
+# vendor's payload needs for the normalizer's detector to identify it.
+$generator = Join-Path $DemoDir 'gendata.py'
+if (-not (Test-Path $generator)) { throw "Cannot find $generator" }
 
-$fixture = Join-Path $RepoRoot "cybreach_pod_gamma\ocsf_normalizer\tests\fixtures\$($fixtureMap[$Vendor])"
-if (-not (Test-Path $fixture)) {
-    throw "Cannot find fixture: $fixture"
-}
+$count = if ($Count -gt 0) { $Count } else { 1 }
 
 # Gamma is tenant-scoped, so it needs the same token shape Beta mints (a Delta
 # login token has no tenant_id claim and is rejected with 401).
-$token = python -c "import os,time,jose.jwt;print(jose.jwt.encode({'sub':'demo-operator','tenant_id':os.environ.get('B11_SERVICE_TENANT_ID','acme'),'exp':int(time.time())+300},os.environ['SECRET_KEY'],algorithm='HS256'))"
+$token = python -c "import os,time,jose.jwt;print(jose.jwt.encode({'sub':'demo-operator','tenant_id':os.environ['B11_SERVICE_TENANT_ID'],'exp':int(time.time())+300},os.environ['SECRET_KEY'],algorithm='HS256'))"
 if ($LASTEXITCODE -ne 0 -or -not $token) { throw "Could not mint a service token." }
 
-$events = Get-Content $fixture -Raw | ConvertFrom-Json
-$records = if ($events -is [array]) { $events } elseif ($events.results) { $events.results } else { @($events) }
-if ($Count -gt 0 -and $records.Count -gt $Count) {
-    $records = @($records | Select-Object -First $Count)
-}
+$raw = python $generator vendor $Vendor --count $count
+if ($LASTEXITCODE -ne 0) { throw "Could not generate a $Vendor event." }
+$records = $raw | ConvertFrom-Json
+if ($records -isnot [array]) { $records = @($records) }
 
 Write-Host "Feeding $($records.Count) raw $Vendor event(s) to the normalizer"
 Write-Host "  raw format : $Vendor (detected from the payload, not declared)"

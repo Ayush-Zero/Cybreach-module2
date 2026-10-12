@@ -38,11 +38,13 @@ USAGE
 -----
     python demo/full-pipeline.py -All
     python demo/full-pipeline.py -Take 3
-    python demo/full-pipeline.py -Take 1 -Count 0 -Json
+    python demo/full-pipeline.py -Take 1 -Count 3 -Json
     python demo/full-pipeline.py -Preflight
 
 Requires the six services up (demo/start-services.ps1) and Kafka on :9092.
 Reads .env from the repo root using the same keys as demo/demo-env.ps1.
+All telemetry, rules and evidence are generated at runtime; nothing is read
+from the pods' committed test fixtures.
 """
 
 import argparse
@@ -67,6 +69,11 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="kafka.*")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEMO_DIR = Path(__file__).resolve().parent
 
+# The generator lives beside this script. This module's own filename contains a
+# hyphen so it is not importable by name, but gendata is.
+sys.path.insert(0, str(DEMO_DIR))
+import gendata  # noqa: E402
+
 ALPHA = "http://127.0.0.1:8001"
 BETA_VALIDATE = "http://127.0.0.1:8002"
 BETA_PUBLISH = "http://127.0.0.1:8004"
@@ -88,14 +95,6 @@ CONTRACT_FIELDS = (
     "matched_evidence_ref",
     "regulatory_control_refs",
 )
-
-VENDOR_FIXTURES = {
-    "splunk": "splunk_events.json",
-    "elastic": "ecs_events.json",
-    "sentinel": "sentinel_events.json",
-    "qradar": "qradar_events.json",
-    "logscale": "logscale_events.json",
-}
 
 WIDTH = 78
 
@@ -124,7 +123,10 @@ def load_env():
         os.environ.setdefault(key.strip(), value.strip())
 
     os.environ.setdefault("SECRET_KEY", "demo-only-shared-key-not-for-production")
-    os.environ.setdefault("B11_SERVICE_TENANT_ID", "acme")
+    # The run tenant is minted once per run by start-services.ps1 and shared by
+    # every service. Reading it back here (and creating it if absent) keeps this
+    # script on the same tenant as the services it drives.
+    os.environ["B11_SERVICE_TENANT_ID"] = gendata.run_tenant()
 
 
 def mint_service_token():
@@ -140,7 +142,7 @@ def mint_service_token():
     return jose.jwt.encode(
         {
             "sub": "demo-operator",
-            "tenant_id": os.environ.get("B11_SERVICE_TENANT_ID", "acme"),
+            "tenant_id": os.environ["B11_SERVICE_TENANT_ID"],
             "exp": int(time.time()) + 900,
         },
         secret,
@@ -226,18 +228,6 @@ def verify_hash(payload):
     return digest == payload.get("content_hash")
 
 
-def read_fixture(relative):
-    path = REPO_ROOT / relative
-    if not path.exists():
-        raise RuntimeError(f"missing fixture: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict) and "results" in payload:
-        return payload["results"]
-    return [payload]
-
-
 def run_id():
     return time.strftime("%H%M%S")
 
@@ -300,14 +290,15 @@ def take_1_ocsf(args, state):
     token = mint_service_token()
     normalized = None
 
-    for vendor in VENDOR_FIXTURES:
-        relative = f"cybreach_pod_gamma/ocsf_normalizer/tests/fixtures/{VENDOR_FIXTURES[vendor]}"
-        records = read_fixture(relative)
-        if args.Count > 0:
-            records = records[: args.Count]
+    # Records are generated per run -- the demo does not read Gamma's committed
+    # fixtures. The detector still has to recognise the format from the payload,
+    # which is the point of the take.
+    count = args.Count if args.Count > 0 else 1
+    for vendor in gendata.VENDORS:
+        records = [gendata.make_vendor_event(vendor) for _ in range(count)]
 
         print()
-        print(f"  -- {vendor} ({len(records)} record(s))")
+        print(f"  -- {vendor} ({len(records)} record(s), generated this run)")
         for record in records:
             result = http(
                 "POST",
@@ -348,27 +339,15 @@ def take_2_alpha(args, state):
     say("A rule's identity is a content hash, not an integer -- so the same rule")
     say("resolves to the same id on every pod and verdicts stay joinable.")
 
-    token = state.get("service_token") or mint_service_token()
-    state["service_token"] = token
+    # The rule is generated at runtime, written to a temp directory, ingested,
+    # and the directory deleted. Nothing here reads a committed fixture.
+    tenant = os.environ["B11_SERVICE_TENANT_ID"]
+    seeded = gendata.seed_rule(tenant=tenant, secret=os.environ["SECRET_KEY"])
+    items = seeded["rules"]
+    state["technique"] = seeded["technique"]
 
-    rules_dir = REPO_ROOT / "cybreach_pod_alpha/rule ingestion/tests/fixtures/rule_repo/sigma"
-    if not rules_dir.exists():
-        raise RuntimeError(f"missing Sigma repo: {rules_dir}")
-
-    ingested = http(
-        "POST",
-        f"{ALPHA}/api/v2/rules/ingest",
-        token=token,
-        payload={
-            "repo_url": str(rules_dir),
-            "branch": "main",
-            "rule_types": ["sigma"],
-            "include_validation": True,
-        },
-        timeout=120,
-    )
-    items = ingested if isinstance(ingested, list) else ingested.get("rules", [])
-    field("ingested", f"{len(items)} rules for tenant {os.environ.get('B11_SERVICE_TENANT_ID')}")
+    field("generated", f"technique {seeded['technique']} (generated, not from disk)")
+    field("ingested", f"{len(items)} rule(s) for tenant {tenant}")
 
     for rule in items[:5]:
         print(
@@ -395,20 +374,13 @@ def take_3_beta(args, state):
 
     from kafka import KafkaConsumer, KafkaProducer, TopicPartition
 
-    run = run_id()
-    action_id = f"act-pipeline-{run}"
-
-    # The demo evidence is T1059.001 because rule_matching.matches_technique is
-    # exact string equality (rule_matching.py:53) -- "T1059" will NOT match
-    # "T1059.001", and neither side does sub-technique matching.
-    event = {
-        "action_id": action_id,
-        "correlation_key": f"corr-pipeline-{run}",
-        "technique_ref": "T1059.001",
-        "target_asset_ref": "host-web-01",
-        "expected_observable": "powershell.exe spawned by services.exe",
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
+    # The rule generated in take 2 (or its prerequisite) decided a technique.
+    # The evidence must carry the SAME one: rule_matching.matches_technique is
+    # exact string equality (rule_matching.py:53), so "T1059" will not match
+    # "T1059.001" and neither side does sub-technique matching.
+    technique = state.get("technique") or gendata.make_sigma_rule()[1]
+    event, technique = gendata.make_evidence(technique)
+    action_id = event["action_id"]
 
     # Sit at the END of the verdict topic before publishing, so only verdicts
     # this run causes are read and no older message is reprinted.
@@ -467,7 +439,7 @@ def take_3_beta(args, state):
 
     print()
     if verdict.get("verdict") == "NoData":
-        say("NoData, not Missed. No Alpha rule carries technique_ref T1059.001")
+        say(f"NoData, not Missed. No Alpha rule carries technique_ref {technique}")
         say("for this tenant, so there was nothing to evaluate.")
     elif verdict.get("verdict") == "Detected":
         say("Confidence is a flat 0.9 here, not a match score. Alpha-sourced rules")
@@ -687,14 +659,11 @@ def take_6_gamma_revalidate(args, state):
 
     normalized = (state.get("normalized") or {})
     if not normalized:
-        records = read_fixture(
-            "cybreach_pod_gamma/ocsf_normalizer/tests/fixtures/splunk_events.json"
-        )
         normalized = http(
             "POST",
             f"{GAMMA_NORMALIZE}/api/v2/ocsf/normalize",
             token=token,
-            payload={"log": records[0]},
+            payload={"log": gendata.make_vendor_event("splunk")},
         )
 
     run = run_id()
@@ -813,7 +782,7 @@ def main():
     parser.add_argument("-Take", type=int, choices=[0, 1, 2, 3, 4, 5, 6], help="run one take")
     parser.add_argument("-All", action="store_true", help="run every take in order")
     parser.add_argument("-Preflight", action="store_true", help="check services and Kafka")
-    parser.add_argument("-Count", type=int, default=1, help="fixture records per vendor (0 = all)")
+    parser.add_argument("-Count", type=int, default=1, help="generated records per vendor")
     parser.add_argument("-Json", action="store_true", help="print full response bodies")
     parser.add_argument("-Wait", type=int, default=30, help="seconds to wait for a verdict")
     parser.add_argument(

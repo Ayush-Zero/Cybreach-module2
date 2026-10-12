@@ -13,7 +13,9 @@ param(
     [string]$LogDir,
     # Append to existing logs instead of truncating them. Useful when a service
     # is restarted mid-demo and you want the earlier output kept.
-    [switch]$AppendLog
+    [switch]$AppendLog,
+    # Reuse the tenant from the previous run instead of minting a fresh one.
+    [switch]$KeepTenant
 )
 
 $DemoDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -31,6 +33,24 @@ if (-not (Test-Path $EnvScript)) {
 if (-not (Test-Path $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 }
+
+# --- One tenant for this run ----------------------------------------------
+# start-services.ps1 is the run boundary: it mints the tenant every window will
+# share and writes it to demo\.run\tenant, which demo-env.ps1 reads. A new
+# invocation is therefore a new run with a new tenant, unless -KeepTenant is
+# passed. Beta's Kafka consumer reads B11_SERVICE_TENANT_ID once at process
+# start, so rotating the tenant without restarting Beta would break the bus.
+$RunDir     = Join-Path $DemoDir '.run'
+$TenantFile = Join-Path $RunDir 'tenant'
+if (-not (Test-Path $RunDir)) { New-Item -ItemType Directory -Path $RunDir -Force | Out-Null }
+if ($KeepTenant -and (Test-Path $TenantFile)) {
+    $RunTenant = (Get-Content $TenantFile -Raw -EA SilentlyContinue) -replace [char]0xFEFF, ''
+    $RunTenant = $RunTenant.Trim()
+} else {
+    $RunTenant = "demo-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+}
+Set-Content -Path $TenantFile -Value $RunTenant -Encoding Ascii
+Write-Host "[run] tenant $RunTenant (demo\.run\tenant)" -ForegroundColor Green
 
 # Each service must exist before we open a window for it, otherwise uvicorn
 # fails with a confusing "module not found" instead of a clear message here.

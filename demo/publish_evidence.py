@@ -1,56 +1,44 @@
-"""Publish one evidence event and wait for the verdict it causes.
+"""Publish one freshly generated evidence event and wait for the verdict it causes.
 
-This is the demo's end-to-end step. It puts a single event on
-`cybreach.evidence.v1`, Beta's consumer picks it up, and the verdict Beta
-publishes to `cybreach.verdicts.v2` is printed here. One command therefore
-demonstrates the whole cross-pod chain instead of requiring a trip to Kafka UI
-to confirm anything happened.
+This is the demo's end-to-end step. A unique evidence event is generated at
+runtime, a Sigma rule covering the same MITRE technique is generated and
+ingested into Alpha, the event is put on `cybreach.evidence.v1`, Beta's consumer
+picks it up, and the verdict Beta publishes to `cybreach.verdicts.v2` is printed
+here. One command therefore demonstrates the whole cross-pod chain instead of
+requiring a trip to Kafka UI to confirm anything happened.
 
-No token is required: the broker is PLAINTEXT and the evidence topic is not
-JWT-gated. A Sigma rule must already be ingested into Alpha (see
-`seed-rule.ps1`) or the verdict comes back `NoData` instead of `Detected`.
+Nothing is committed and nothing is static. The technique is chosen per run, the
+rule and the evidence are built from it in the same run (Beta compares
+technique_ref by exact equality, so they must agree), and the action_id is a
+fresh UUID -- so repeated takes produce distinct content hashes on the topic.
 
-Re-recording is safe: nothing in the chain deduplicates. The broker is
-append-only, Beta's consumer keeps no seen-set, and `vp_app` is stateless.
-Republishing the same event simply writes another message. Change ACTION_ID
-between takes if you want distinct content hashes on the topic.
+The tenant is the shared run tenant (demo/.run/tenant), minted by
+start-services.ps1 and read by every service. Run start-services.ps1 first, or
+this will seed a rule and publish evidence under a tenant Beta is not serving.
+
+No token is required to publish: the broker is PLAINTEXT and the evidence topic
+is not JWT-gated. A service token is required to seed the rule into Alpha.
 """
 
+import argparse
 import hashlib
 import json
+import os
 import sys
 import time
+from pathlib import Path
 
 from kafka import KafkaConsumer, KafkaProducer, TopicPartition
+
+DEMO_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(DEMO_DIR))
+
+import gendata  # noqa: E402  (path set above)
 
 BOOTSTRAP = "localhost:9092"
 EVIDENCE_TOPIC = "cybreach.evidence.v1"
 VERDICT_TOPIC = "cybreach.verdicts.v2"
 WAIT_SECONDS = 30
-
-# Bump the suffix per take so the topic shows distinct verdicts/hashes.
-ACTION_ID = "act-demo-001"
-
-# Must match a rule's mitre_techniques value EXACTLY.
-#
-# Alpha filters with `tech in r.mitre_techniques` and Beta compares with
-# `rule.technique_ref != evidence.technique_ref`, so neither side does
-# sub-technique matching: "T1059" will NOT match the fixture's "T1059.001"
-# and the verdict comes back NoData. Rule 001 in the fixture directory is
-# attack.t1059.001, which is what this references.
-TECHNIQUE_REF = "T1059.001"
-
-# These six fields are exactly `ve_app.models.EvidenceEvent`. Pydantic v2
-# ignores unknown keys by default, but a stray field is a silent contract
-# drift, so nothing extra is sent here.
-EVENT = {
-    "action_id": ACTION_ID,
-    "correlation_key": "corr-demo-001",
-    "technique_ref": TECHNIQUE_REF,
-    "target_asset_ref": "web-01",
-    "expected_observable": "powershell.exe spawned by services.exe",
-    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-}
 
 # The frozen v2.0 verdict contract, as asserted by the cross-pod contract test.
 CONTRACT_FIELDS = (
@@ -65,17 +53,45 @@ CONTRACT_FIELDS = (
 
 
 def verify_hash(payload):
-    """Re-derive content_hash from the eight frozen fields, as Delta does."""
+    """Re-derive content_hash from the seven frozen fields, as Delta does."""
+
     projected = {name: payload.get(name) for name in CONTRACT_FIELDS}
     digest = hashlib.sha256(
-        json.dumps(
-            projected, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
+        json.dumps(projected, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return digest == payload.get("content_hash")
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--no-seed",
+        action="store_true",
+        help="do not ingest a matching rule first (expect NoData unless one exists)",
+    )
+    parser.add_argument("--technique", help="pin the MITRE technique for this run")
+    args = parser.parse_args()
+
+    gendata.load_env()
+    tenant = gendata.run_tenant()
+    secret = os.environ.get("SECRET_KEY", "")
+
+    technique = args.technique
+    if not args.no_seed:
+        print(f"Seeding a generated rule for tenant {tenant}...")
+        seeded = gendata.seed_rule(tenant=tenant, secret=secret, technique=technique)
+        technique = seeded["technique"]
+        for rule in seeded["rules"]:
+            print(
+                f"  rule {str(rule.get('rule_id'))[:16]}..  {rule.get('title')}  "
+                f"{rule.get('mitre_techniques')}"
+            )
+
+    event, technique = gendata.make_evidence(technique)
+    action_id = event["action_id"]
+    print(f"\nGenerated evidence {action_id} (technique {technique}):")
+    print(json.dumps(event, indent=2))
+
     # Position the reader at the END of the verdict topic BEFORE publishing, so
     # only verdicts this run causes are read and no older message is reprinted.
     reader = KafkaConsumer(
@@ -86,17 +102,17 @@ def main():
     partition = TopicPartition(VERDICT_TOPIC, 0)
     reader.assign([partition])
     start_offset = reader.end_offsets([partition])[partition]
-    print(f"Watching {VERDICT_TOPIC} from offset {start_offset}")
+    print(f"\nWatching {VERDICT_TOPIC} from offset {start_offset}")
 
     producer = KafkaProducer(
         bootstrap_servers=BOOTSTRAP,
         value_serializer=lambda value: json.dumps(value).encode("utf-8"),
     )
-    metadata = producer.send(EVIDENCE_TOPIC, EVENT).get(timeout=30)
+    metadata = producer.send(EVIDENCE_TOPIC, event).get(timeout=30)
     producer.flush()
     producer.close()
     print(
-        f"Published {ACTION_ID} to {metadata.topic} "
+        f"Published {action_id} to {metadata.topic} "
         f"[partition {metadata.partition}, offset {metadata.offset}]"
     )
     print(f"Waiting up to {WAIT_SECONDS}s for Beta to validate and publish...\n")
@@ -111,7 +127,7 @@ def main():
                 payload = json.loads(message.value.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
                 continue
-            if payload.get("action_id") == ACTION_ID:
+            if payload.get("action_id") == action_id:
                 verdict = payload
                 break
         if verdict is None:
@@ -120,9 +136,9 @@ def main():
     reader.close()
 
     if verdict is None:
-        print(f"No verdict for {ACTION_ID} within {WAIT_SECONDS}s.")
+        print(f"No verdict for {action_id} within {WAIT_SECONDS}s.")
         print("Check: Beta running with VERDICT_PUBLISH_ENABLED=true, and")
-        print("       B11_SERVICE_TENANT_ID set to a tenant with rules.")
+        print("       B11_SERVICE_TENANT_ID set to this run's tenant (see demo-env.ps1).")
         return 1
 
     print("=" * 62)
@@ -136,8 +152,8 @@ def main():
 
     if verdict.get("verdict") != "Detected":
         print(
-            "\nNote: verdict is not 'Detected' -- either Alpha has no matching "
-            "rule\n(run seed-rule.ps1 first) or Beta could not reach Alpha."
+            "\nNote: verdict is not 'Detected' -- Beta did not find a rule with "
+            f"technique {technique}\nfor tenant {tenant} (or could not reach Alpha)."
         )
     return 0
 

@@ -82,9 +82,25 @@ if (-not $env:ADMIN_PASSWORD) {
     throw "demo-env.ps1: ADMIN_PASSWORD is not set. Set it in .env or your environment."
 }
 
+# --- Demo run identity ----------------------------------------------------
+# One tenant per demo run, shared by every service. start-services.ps1 mints it
+# and writes it here; this reads it so each of the six windows agrees. Sourcing
+# this file mid-run therefore never rotates the tenant -- only start-services
+# does, because Beta's Kafka consumer reads its tenant once at process start.
+$RunDir     = Join-Path $DemoDir '.run'
+$TenantFile = Join-Path $RunDir 'tenant'
+if (-not (Test-Path $RunDir)) { New-Item -ItemType Directory -Path $RunDir -Force | Out-Null }
+if (Test-Path $TenantFile) {
+    $raw = Get-Content $TenantFile -Raw
+    $env:B11_SERVICE_TENANT_ID = ($raw -replace [char]0xFEFF, '').Trim()
+}
+if (-not $env:B11_SERVICE_TENANT_ID) {
+    $env:B11_SERVICE_TENANT_ID = "demo-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+    Set-Content -Path $TenantFile -Value $env:B11_SERVICE_TENANT_ID -Encoding Ascii
+}
+
 # --- Beta live-bus wiring -------------------------------------------------
 $env:KAFKA_EVIDENCE_ENABLED = 'true'
-$env:B11_SERVICE_TENANT_ID = 'acme'
 $env:VERDICT_PUBLISH_ENABLED = 'true'
 $env:ALPHA_RULES_URL = 'http://127.0.0.1:8001/api/v2/rules/search'
 # The publisher's route is /api/v2/publish -- NOT /api/v2/verdicts/publish.
@@ -103,4 +119,5 @@ Write-Host '[demo-env] loaded. Database split:' -ForegroundColor Green
 Write-Host "  Alpha -> alpha_rule_ingestion (own alembic chain)" -ForegroundColor Green
 Write-Host "  Delta -> $($env:POSTGRES_DB) (owns 0001_initial_verdict_platform)" -ForegroundColor Green
 Write-Host '[demo-env] one SECRET_KEY shared by all six services.' -ForegroundColor Green
+Write-Host "[demo-env] run tenant: $($env:B11_SERVICE_TENANT_ID)" -ForegroundColor Green
 Write-Host ''
