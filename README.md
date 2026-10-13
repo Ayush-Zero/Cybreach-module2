@@ -18,6 +18,11 @@ exercises each pod's real endpoints, and tails their logs. Every path is derived
 from each script's own location, so the folder works from anywhere in the repo.
 Run all commands from the **repo root**.
 
+The demo reads **no committed test data**. Rules, evidence and vendor telemetry
+are generated in memory per run by `demo/gendata.py`, so no two runs look alike
+and nothing in the repo exists only to be demonstrated. The pods' test fixtures
+stay with the test suites.
+
 ### Ports
 
 | Port | Service | Pod |
@@ -38,7 +43,7 @@ Run all commands from the **repo root**.
 Infrastructure runs in Docker, services run on the host:
 
 ```powershell
-Copy-Item .env.example .env      # then set POSTGRES_USER and POSTGRES_PASSWORD
+Copy-Item .env.example .env      # set POSTGRES_USER, POSTGRES_PASSWORD, ADMIN_USERNAME, ADMIN_PASSWORD
 docker compose up -d             # Postgres, Redis, Kafka (KRaft), Kafka UI
 ```
 
@@ -59,20 +64,47 @@ obvious culprit. Dot-source it into any shell you intend to run from:
 
 The leading dot matters — without it the variables land in a child scope and
 vanish. It sets `SECRET_KEY`, the per-pod `DATABASE_URL`, the Kafka bootstrap,
-`M2_TOPICS_PATH`, the Delta admin credentials, and the Beta live-bus flags
+`M2_TOPICS_PATH`, the shared run tenant, and the Beta live-bus flags
 (`KAFKA_EVIDENCE_ENABLED`, `VERDICT_PUBLISH_ENABLED`, `ALPHA_RULES_URL`).
+
+It also **requires** `ADMIN_USERNAME` and `ADMIN_PASSWORD`. There is no default
+— Delta is deliberately fail-closed, so set them in `.env` or the shell; without
+them `demo-env.ps1` refuses to load rather than half-starting a service.
+
+### Runtime data and the run tenant
+
+`demo/gendata.py` is the single source of demo data. It generates a Sigma rule, a
+matching evidence event, and raw vendor telemetry for Splunk, Elastic, Sentinel,
+QRadar and LogScale — in memory, per run. The rule is written to a temporary
+directory, ingested through Alpha's real endpoint, and then deleted. It is both a
+library (imported by the Python scripts) and a CLI (used by the PowerShell ones):
+
+```powershell
+python .\demo\gendata.py sigma                 # print a generated Sigma rule
+python .\demo\gendata.py evidence              # print a generated evidence event
+python .\demo\gendata.py vendor splunk --count 3
+python .\demo\gendata.py seed                  # generate + ingest a rule into Alpha
+```
+
+One id ties a run together: `start-services.ps1` mints a tenant and writes it to
+`demo/.run/tenant`, and `demo-env.ps1` reads it, so all six services validate
+under the same tenant. A fresh `start-services.ps1` invocation is a fresh tenant;
+pass `-KeepTenant` to reuse the previous one. Beta's Kafka consumer reads its
+tenant once at process start, so rotating the tenant without restarting Beta
+breaks the bus.
 
 ### Scripts
 
 | File | Purpose |
 | --- | --- |
 | `demo-env.ps1` | Shared environment. Dot-source it; never run it standalone. |
-| `start-services.ps1` | Launches the six services in separate windows, each dot-sourcing `demo-env.ps1`, teeing output to `demo/logs/<service>.log`. |
+| `start-services.ps1` | Launches the six services in separate windows, each dot-sourcing `demo-env.ps1`, teeing output to `demo/logs/<service>.log`. Mints the per-run tenant. |
 | `health-check.ps1` | Read-only probe of all six services plus the Beta Kafka consumer group and its lag. |
 | `tail-logs.ps1` | Follow one service's log, or all six. |
-| `seed-rule.ps1` | Ingests the fixture Sigma rules into Alpha so validation can return `Detected`. |
-| `publish_evidence.py` | Publishes one evidence event to `cybreach.evidence.v1`, waits for Beta's verdict on `cybreach.verdicts.v2`, and re-derives its `content_hash`. |
-| `normalize-event.ps1` | Feeds a raw vendor event to Gamma's normalizer and prints the canonical OCSF result. |
+| `gendata.py` | Generates the Sigma rule, evidence event and vendor telemetry at runtime; also ingests generated rules into Alpha. Library and CLI. |
+| `seed-rule.ps1` | Generates a Sigma rule and ingests it into Alpha so validation can return `Detected`. `-RulesDir` ingests real rules from disk instead. |
+| `publish_evidence.py` | Publishes one generated evidence event to `cybreach.evidence.v1`, waits for Beta's verdict on `cybreach.verdicts.v2`, and re-derives its `content_hash`. |
+| `normalize-event.ps1` | Feeds generated vendor telemetry to Gamma's normalizer and prints the canonical OCSF result. |
 | `populate-delta-dashboard.ps1` | Exercises Delta's own `POST /api/v2/validate` so a verdict is persisted and appears in the dashboard. |
 | `red-to-green.ps1` | Proves a detection gap, fixes the rule, and re-validates the same stored evidence. |
 | `full-pipeline.py` | Runs every cross-pod seam that exists, as six independently runnable takes. |
@@ -104,6 +136,13 @@ Logs:
 python .\demo\publish_evidence.py
 ```
 
+`seed-rule.ps1` generates a fresh Sigma rule (a random valid MITRE technique) and
+ingests it through Alpha's real `POST /api/v2/rules/ingest`; pass `-RulesDir` to
+ingest `.yml`/`.yaml` rules from disk instead, or `-Technique` to pin the MITRE
+id. `publish_evidence.py` seeds a rule for the **same** technique before
+publishing, because Beta compares `technique_ref` by exact equality; use
+`--no-seed` to skip that step (expect `NoData`).
+
 `seed-rule.ps1` must be re-run after **every** Alpha restart. Alpha's
 `/rules/search` serves from an in-memory dict, not from Postgres, so a rule row
 is invisible to validation until the currently running process has ingested it.
@@ -115,6 +154,31 @@ before publishing, so it prints only the verdict its own event causes, then
 re-derives `content_hash` from the eight frozen contract fields to prove the
 digest matches.
 
+#### Inspecting the bus (Kafka UI)
+
+Kafka UI ships with the infrastructure stack at **http://localhost:8080**
+(cluster `local`). Use it to confirm a message really moved, rather than trusting
+that a script printed something.
+
+- **`cybreach.evidence.v1`** — the evidence events; `action_id` and
+  `technique_ref` are the fields to point at.
+- **`cybreach.verdicts.v2`** — Beta's reply. It must carry the same `action_id`
+  and `verdict: Detected`. It has **no consumer** — Delta writes to its own
+  Postgres and never reads this topic — so an empty consumer list here is
+  expected, not a fault.
+- **`cybreach.gap_closed.v2`** — written by Delta's re-validation
+  (`red-to-green.ps1`, take 5).
+- **`cybreach.revalidation.v1`** and **`cybreach.connector.health.v1`** — Gamma's
+  topics; they appear only after Gamma produces to them.
+- **`cybreach.evidence.v1.dlq`** — written **only** for malformed evidence, never
+  for `Missed`/`NoData`. A non-empty dead-letter topic means some publisher sent a
+  schema-invalid event.
+
+The **Consumers** tab's `validation-engine-evidence` group should show an active
+member and lag 0; no members means Beta's consumer never started (see the
+`health-check.ps1` note above). `__consumer_offsets` is Kafka's internal topic,
+and a topic like `m2_local_check` is a manual connectivity smoke-test — neither
+is part of the demo.
 
 #### Normalizing vendor telemetry
 
@@ -122,12 +186,14 @@ digest matches.
 .\demo\normalize-event.ps1 -Vendor splunk            # summary line only
 .\demo\normalize-event.ps1 -Vendor splunk -Json      # full OCSF event body
 .\demo\normalize-event.ps1 -Vendor elastic -Json     # same endpoint, ECS input
-.\demo\normalize-event.ps1 -Count 0 -Json            # whole fixture at once
+.\demo\normalize-event.ps1 -Vendor sentinel -Count 5 # five generated events
 ```
 
 `-Vendor` accepts `splunk`, `elastic`, `sentinel`, `qradar`, `logscale`. The
 source format is detected from the payload rather than declared by the caller,
-so one endpoint handles all five. OCSF class 3002 is Authentication.
+so one endpoint handles all five. OCSF class 3002 is Authentication. Telemetry is
+generated per call (`-Count`, default 1), so repeated runs produce distinct
+events.
 
 `-Json` and `-Follow` are mutually exclusive: `-Follow` returns before the
 request is sent, so it only tails the log.
@@ -139,9 +205,9 @@ request is sent, so it only tails the log.
 cd cybreach_pod_delta\frontend-dashboard; npm run dev    # http://127.0.0.1:5173
 ```
 
-Sign in with the `ADMIN_USERNAME` / `ADMIN_PASSWORD` from `demo-env.ps1`
-(`demo` / `demo123` by default). Delta has no default credentials on purpose,
-so login returns 401 until they are set.
+Sign in with `ADMIN_USERNAME` / `ADMIN_PASSWORD`. There is **no default** —
+`demo-env.ps1` refuses to load without them, and Delta returns 401 on login until
+they are set, which is the intended fail-closed behaviour.
 
 #### Proving and closing a detection gap
 
@@ -173,7 +239,7 @@ python demo\full-pipeline.py -Take 1 -Json # full response bodies
 | Take | Pod | What it exercises |
 | --- | --- | --- |
 | 1 | Gamma | Five vendor formats normalised to OCSF; format auto-detected |
-| 2 | Alpha | Sigma fixture rules ingested; rule ids are content hashes |
+| 2 | Alpha | A generated Sigma rule is ingested; rule ids are content hashes |
 | 3 | Beta | Evidence published to the bus, validated, verdict on `cybreach.verdicts.v2` |
 | 4 | Delta | `POST /api/v2/validate` persisted to Postgres and pushed over the WebSocket |
 | 5 | Delta | Red-to-green: `Missed` → rule tightened → `Detected`, `gap_closed=true` |
@@ -181,7 +247,7 @@ python demo\full-pipeline.py -Take 1 -Json # full response bodies
 
 Takes 2, 3 and 6 depend on state produced by an earlier take and run it
 automatically, so any single take is runnable on its own. Options: `-Count`
-(fixture records per vendor, `0` for all), `-Json` (full bodies), `-Wait`
+(generated records per vendor, default 1), `-Json` (full bodies), `-Wait`
 (seconds to wait for a verdict), `-Force` (run despite a failed preflight).
 
 Read the output before trusting it:
